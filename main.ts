@@ -1,7 +1,7 @@
 /**
- * Git Forge 服务端启动与生命周期管理器 (v1.1.2)
+ * Git Forge 服务端启动与生命周期管理器 (v1.2.0)
  *
- * 遵循 GitHub Core Clone 规范进行环境握手与评测生命周期监听。
+ * 遵循 GitHub Core Clone 规范进行环境握手与评测生命周期监听，支持 GraphQL v4 评测引擎。
  */
 
 import { createApp } from './app.ts';
