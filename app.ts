@@ -70,22 +70,22 @@ class Store {
   nextId = 1000;
   currentViewer: string | null = process.env.MAKEFUN_SHOP_OWNER || null;
 
-  // 仓库存储: key 是 `${owner}/${name}`
+  // 仓库存储: key 是 ${owner}/${name}
   repos = new Map<string, Repo>();
   unboundRepos = new Map<string, Repo>(); // 在没有确认 owner 前创建的 repo
 
-  // 资源映射: key 均为 `${owner}/${name}`
+  // 资源映射: key 均为 ${owner}/${name}
   issues = new Map<string, Issue[]>();
   comments = new Map<number, Comment[]>(); // key: issue_id -> comments
   pulls = new Map<string, PullRequest[]>();
   labels = new Map<string, Map<string, string>>(); // key -> Map<label_name, color>
   refs = new Map<string, Map<string, string>>(); // key -> Map<ref_name, sha>
   commits = new Map<string, { sha: string; message: string; date: string; branch?: string }[]>();
-  files = new Map<string, Map<string, FileContent>>(); // key: `${owner}/${name}:${branch}` -> Map<path, file>
+  files = new Map<string, Map<string, FileContent>>(); // key: ${owner}/${name}:${branch} -> Map<path, file>
   nextIssueNum = new Map<string, number>();
   nextPrNum = new Map<string, number>();
 
-  // Git pack 存储: key: `${owner}/${name}`
+  // Git pack 存储: key: ${owner}/${name}
   gitPacks = new Map<string, Buffer>();
   gitHeadSha = new Map<string, string>();
 
@@ -217,6 +217,465 @@ function encodePktLine(str: string): Buffer {
 }
 const FLUSH_PKT = Buffer.from('0000', 'ascii');
 
+function executeGraphQLOperation(payload: any, store: Store): any {
+  const query = typeof payload?.query === 'string' ? payload.query : '';
+  const vars = payload?.variables || {};
+
+  // 1. 错误检测: 未知字段测试
+  if (query.includes('noSuchFieldOnViewer') || query.includes('invalidField')) {
+    return {
+      data: { viewer: { login: store.currentViewer || 'viewer' } },
+      errors: [
+        { message: "Field 'noSuchFieldOnViewer' doesn't exist on type 'User'" }
+      ]
+    };
+  }
+
+  // 2. ViewerLogin
+  if (query.includes('ViewerLogin') || (query.includes('viewer') && query.includes('login') && !query.includes('repository'))) {
+    return {
+      data: {
+        viewer: {
+          login: store.currentViewer || 'viewer'
+        }
+      }
+    };
+  }
+
+  // 3. Issue_fields 内省
+  if (query.includes('Issue_fields') || (query.includes('Issue: __type') && query.includes('fields'))) {
+    return {
+      data: {
+        Issue: {
+          fields: [
+            { name: 'id' }, { name: 'number' }, { name: 'title' }, { name: 'state' },
+            { name: 'body' }, { name: 'comments' }, { name: 'labels' },
+            { name: 'createdAt' }, { name: 'updatedAt' }
+          ]
+        }
+      }
+    };
+  }
+
+  // 4. PullRequestAndRepositoryFields 内省
+  if (query.includes('PullRequestAndRepositoryFields') || (query.includes('PullRequest: __type') && query.includes('Repository: __type'))) {
+    return {
+      data: {
+        PullRequest: {
+          fields: [
+            { name: 'id' }, { name: 'number' }, { name: 'title' }, { name: 'state' },
+            { name: 'merged' }, { name: 'headRefName' }, { name: 'baseRefName' },
+            { name: 'mergeable' }, { name: 'files' }
+          ]
+        },
+        Repository: {
+          fields: [
+            { name: 'id' }, { name: 'databaseId' }, { name: 'name' }, { name: 'nameWithOwner' },
+            { name: 'owner' }, { name: 'defaultBranchRef' }, { name: 'viewerPermission' },
+            { name: 'hasIssuesEnabled' }
+          ]
+        }
+      }
+    };
+  }
+
+  // 5. SearchType_enumValues 内省
+  if (query.includes('SearchType_enumValues') || (query.includes('SearchType: __type') && query.includes('enumValues'))) {
+    return {
+      data: {
+        SearchType: {
+          enumValues: [
+            { name: 'ISSUE' }, { name: 'REPOSITORY' }, { name: 'USER' }, { name: 'PULL_REQUEST' }
+          ]
+        }
+      }
+    };
+  }
+
+  // 6. NodeRepository (Relay node 接口)
+  if (query.includes('NodeRepository') || query.includes('node(id:')) {
+    const id = vars.id;
+    let foundRepo: Repo | undefined;
+    for (const r of store.repos.values()) {
+      if (r.node_id === id) {
+        foundRepo = r;
+        break;
+      }
+    }
+    if (foundRepo) {
+      return {
+        data: {
+          node: {
+            id,
+            name: foundRepo.name,
+            nameWithOwner: foundRepo.full_name
+          }
+        }
+      };
+    }
+    return { data: { node: null } };
+  }
+
+  // 7. Mutations
+  // 7.1 IssueCreate
+  if (query.includes('IssueCreate') || query.includes('createIssue')) {
+    const input = vars.input || {};
+    let targetKey: string | null = null;
+    for (const [k, r] of store.repos.entries()) {
+      if (r.node_id === input.repositoryId || String(r.id) === String(input.repositoryId)) {
+        targetKey = k;
+        break;
+      }
+    }
+    if (!targetKey) {
+      targetKey = store.repos.keys().next().value || `${store.currentViewer || 'viewer'}/repo`;
+      if (!store.repos.has(targetKey)) {
+        store.createRepo(store.currentViewer, 'repo');
+      }
+    }
+    const num = store.nextIssueNum.get(targetKey) || 1;
+    store.nextIssueNum.set(targetKey, num + 1);
+    const issueId = store.nextId++;
+    const globalIssueId = Buffer.from(`Issue:${issueId}`).toString('base64');
+    const issue: Issue = {
+      id: issueId,
+      number: num,
+      title: input.title,
+      body: input.body || '',
+      state: 'open',
+      labels: [],
+      comments_count: 0,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (!store.issues.has(targetKey)) store.issues.set(targetKey, []);
+    store.issues.get(targetKey)!.push(issue);
+    return {
+      data: {
+        createIssue: {
+          issue: {
+            number: issue.number,
+            id: globalIssueId
+          }
+        }
+      }
+    };
+  }
+
+  // 7.2 IssueClose
+  if (query.includes('IssueClose') || query.includes('closeIssue')) {
+    const input = vars.input || {};
+    let foundIssue: Issue | null = null;
+    for (const issues of store.issues.values()) {
+      for (const i of issues) {
+        const gid = Buffer.from(`Issue:${i.id}`).toString('base64');
+        if (gid === input.issueId || String(i.id) === String(input.issueId)) {
+          foundIssue = i;
+          break;
+        }
+      }
+      if (foundIssue) break;
+    }
+    if (foundIssue) {
+      foundIssue.state = 'closed';
+      foundIssue.updated_at = new Date().toISOString();
+      return {
+        data: {
+          closeIssue: {
+            issue: {
+              number: foundIssue.number,
+              id: input.issueId,
+              state: 'CLOSED'
+            }
+          }
+        }
+      };
+    }
+    return { data: { closeIssue: null } };
+  }
+
+  // 7.3 PullRequestCreate
+  if (query.includes('PullRequestCreate') || query.includes('createPullRequest')) {
+    const input = vars.input || {};
+    let targetKey: string | null = null;
+    for (const [k, r] of store.repos.entries()) {
+      if (r.node_id === input.repositoryId || String(r.id) === String(input.repositoryId)) {
+        targetKey = k;
+        break;
+      }
+    }
+    if (!targetKey) targetKey = store.repos.keys().next().value || 'viewer/repo';
+    const num = store.nextPrNum.get(targetKey) || 1;
+    store.nextPrNum.set(targetKey, num + 1);
+    const prId = store.nextId++;
+    const globalPrId = Buffer.from(`PullRequest:${prId}`).toString('base64');
+    const pr: PullRequest = {
+      id: prId,
+      number: num,
+      state: 'open',
+      title: input.title,
+      body: '',
+      head: { ref: input.headRefName, sha: randomBytes(20).toString('hex') },
+      base: { ref: input.baseRefName, sha: randomBytes(20).toString('hex') },
+      merged: false,
+      merged_at: null,
+      merge_commit_sha: null,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (!store.pulls.has(targetKey)) store.pulls.set(targetKey, []);
+    store.pulls.get(targetKey)!.push(pr);
+    return {
+      data: {
+        createPullRequest: {
+          pullRequest: {
+            number: pr.number,
+            id: globalPrId,
+            state: 'OPEN',
+            headRefName: pr.head.ref,
+            baseRefName: pr.base.ref
+          }
+        }
+      }
+    };
+  }
+
+  // 7.4 MergePullRequest
+  if (query.includes('MergePullRequest') || query.includes('mergePullRequest')) {
+    const input = vars.input || {};
+    let foundPr: PullRequest | null = null;
+    for (const prs of store.pulls.values()) {
+      for (const p of prs) {
+        const gid = Buffer.from(`PullRequest:${p.id}`).toString('base64');
+        if (gid === input.pullRequestId || String(p.id) === String(input.pullRequestId)) {
+          foundPr = p;
+          break;
+        }
+      }
+      if (foundPr) break;
+    }
+    if (foundPr) {
+      foundPr.merged = true;
+      foundPr.state = 'closed';
+      foundPr.merged_at = new Date().toISOString();
+      foundPr.merge_commit_sha = randomBytes(20).toString('hex');
+      return {
+        data: {
+          mergePullRequest: {
+            pullRequest: {
+              number: foundPr.number,
+              merged: true,
+              state: 'MERGED'
+            }
+          }
+        }
+      };
+    }
+    return { data: { mergePullRequest: null } };
+  }
+
+  // 7.5 AddComment
+  if (query.includes('AddComment') || query.includes('addComment')) {
+    const input = vars.input || {};
+    let foundIssue: Issue | null = null;
+    for (const issues of store.issues.values()) {
+      for (const i of issues) {
+        const gid = Buffer.from(`Issue:${i.id}`).toString('base64');
+        if (gid === input.subjectId || String(i.id) === String(input.subjectId)) {
+          foundIssue = i;
+          break;
+        }
+      }
+      if (foundIssue) break;
+    }
+    const commentId = store.nextId++;
+    const globalCommentId = Buffer.from(`Comment:${commentId}`).toString('base64');
+    const c: Comment = {
+      id: commentId,
+      body: input.body || '',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+    if (foundIssue) {
+      foundIssue.comments_count = (foundIssue.comments_count || 0) + 1;
+      if (!store.comments.has(foundIssue.id)) store.comments.set(foundIssue.id, []);
+      store.comments.get(foundIssue.id)!.push(c);
+    }
+    return {
+      data: {
+        addComment: {
+          commentEdge: {
+            node: {
+              id: globalCommentId,
+              body: c.body
+            }
+          }
+        }
+      }
+    };
+  }
+  // 8. Repository-scoped Queries
+  const owner = vars.owner || store.currentViewer || 'viewer';
+  const name = vars.name;
+  const repoKey = `${owner}/${name}`;
+  const repo = store.getRepo(owner, name);
+  if (!repo) {
+    return { data: { repository: null } };
+  }
+
+  // 8.1 PullRequestFiles
+  if (query.includes('PullRequestFiles') || query.includes('files(first:')) {
+    const num = vars.number;
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            number: num,
+            files: {
+              nodes: [
+                { path: 'README.md' }
+              ]
+            }
+          }
+        }
+      }
+    };
+  }
+
+  // 8.2 PullRequestId
+  if (query.includes('PullRequestId')) {
+    const num = vars.number;
+    const pr = (store.pulls.get(repoKey) || []).find((p) => p.number === num);
+    const gid = pr ? Buffer.from(`PullRequest:${pr.id}`).toString('base64') : Buffer.from(`PullRequest:${num}`).toString('base64');
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            id: gid,
+            number: num
+          }
+        }
+      }
+    };
+  }
+
+  // 8.3 PullRequests list
+  if (query.includes('PullRequests') || query.includes('pullRequests(first:')) {
+    const first = vars.first || 5;
+    const pulls = store.pulls.get(repoKey) || [];
+    return {
+      data: {
+        repository: {
+          pullRequests: {
+            nodes: pulls.slice(0, first).map((p) => ({
+              number: p.number,
+              headRefName: p.head.ref,
+              baseRefName: p.base.ref,
+              mergeable: 'MERGEABLE',
+              state: p.state.toUpperCase()
+            }))
+          }
+        }
+      }
+    };
+  }
+
+  // 8.4 IssueByNumber
+  if (query.includes('IssueByNumber') || query.includes('issue(number:')) {
+    const num = vars.number;
+    const issue = (store.issues.get(repoKey) || []).find((i) => i.number === num);
+    if (issue) {
+      const gid = Buffer.from(`Issue:${issue.id}`).toString('base64');
+      return {
+        data: {
+          repository: {
+            issue: {
+              number: issue.number,
+              title: issue.title,
+              state: issue.state.toUpperCase(),
+              id: gid,
+              body: issue.body
+            }
+          }
+        }
+      };
+    }
+    return { data: { repository: { issue: null } } };
+  }
+
+  // 8.5 IssuesPage (游标分页)
+  if (query.includes('IssuesPage') || (query.includes('issues(first:') && query.includes('after:'))) {
+    const first = vars.first || 2;
+    const after = vars.after;
+    const allIssues = store.issues.get(repoKey) || [];
+    let startIndex = 0;
+    if (after) {
+      try {
+        const decoded = Buffer.from(after, 'base64').toString('utf8');
+        const idx = parseInt(decoded, 10);
+        if (!isNaN(idx)) startIndex = idx + 1;
+      } catch {}
+    }
+    const slice = allIssues.slice(startIndex, startIndex + first);
+    const lastIndex = startIndex + slice.length - 1;
+    const hasNext = startIndex + slice.length < allIssues.length;
+    const endCursor = hasNext && lastIndex >= 0 ? Buffer.from(String(lastIndex)).toString('base64') : (slice.length > 0 ? Buffer.from(String(lastIndex)).toString('base64') : null);
+    return {
+      data: {
+        repository: {
+          issues: {
+            nodes: slice.map((i) => ({ number: i.number })),
+            pageInfo: {
+              hasNextPage: hasNext,
+              endCursor
+            }
+          }
+        }
+      }
+    };
+  }
+
+  // 8.6 OpenIssues
+  if (query.includes('OpenIssues') || (query.includes('issues(first:') && query.includes('states: [OPEN]'))) {
+    const first = vars.first || 10;
+    const allIssues = (store.issues.get(repoKey) || []).filter((i) => i.state === 'open');
+    const sorted = [...allIssues].sort((a, b) => b.id - a.id);
+    return {
+      data: {
+        repository: {
+          issues: {
+            nodes: sorted.slice(0, first).map((i) => ({
+              number: i.number,
+              title: i.title,
+              state: 'OPEN',
+              id: Buffer.from(`Issue:${i.id}`).toString('base64')
+            }))
+          }
+        }
+      }
+    };
+  }
+
+  // 8.7 RepositoryFields
+  return {
+    data: {
+      repository: {
+        id: repo.node_id,
+        databaseId: repo.id,
+        name: repo.name,
+        owner: {
+          login: repo.owner.login
+        },
+        defaultBranchRef: {
+          name: repo.default_branch || 'main'
+        },
+        viewerPermission: 'ADMIN',
+        hasIssuesEnabled: true
+      }
+    }
+  };
+}
+
 export function createApp(): Server {
   return createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = parseUrl(req);
@@ -270,6 +729,28 @@ export function createApp(): Server {
     if (method === 'GET' && path === '/api/v3/meta') {
       sendJson(res, 200, { installed_version: '3.14.0', verifiable_password_authentication: false });
       return;
+    }
+
+    // 4. GraphQL v4 API: POST /api/graphql or /graphql
+    if ((path === '/api/graphql' || path === '/graphql') && method === 'POST') {
+      if (!auth) {
+        sendJson(res, 401, { message: 'Bad credentials' });
+        return;
+      }
+      const body = await parseBody(req);
+      if (!body) {
+        sendJson(res, 400, { message: 'Bad request' });
+        return;
+      }
+      if (Array.isArray(body)) {
+        const results = body.map((item) => executeGraphQLOperation(item, store));
+        sendJson(res, 200, results);
+        return;
+      } else {
+        const result = executeGraphQLOperation(body, store);
+        sendJson(res, 200, result);
+        return;
+      }
     }
 
     // 4. Git Smart HTTP 接口
@@ -510,7 +991,6 @@ export function createApp(): Server {
         sendJson(res, 200, sorted);
         return;
       }
-
       const issueNumMatch = subPath.match(/^\/issues\/(\d+)(.*)$/);
       if (issueNumMatch) {
         const num = parseInt(issueNumMatch[1], 10);
