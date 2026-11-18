@@ -39,9 +39,14 @@ export type AppServer = NetServer & {
   closeIdleConnections(): void;
 };
 
+let activityTick = false;
 let lastRequestActivityMs = performance.now();
 
 export function getLastRequestActivityMs(): number {
+  if (activityTick) {
+    activityTick = false;
+    lastRequestActivityMs = performance.now();
+  }
   return lastRequestActivityMs;
 }
 
@@ -253,6 +258,7 @@ export function createApp(store = new ForgeStore()): AppServer {
     rawBody: Buffer,
     closeConn: boolean,
   ): void => {
+    const reqHost = headers.host || `127.0.0.1:${socket.localPort || 80}`;
     const qIdx = rawUrl.indexOf('?');
     const pathname = qIdx === -1 ? rawUrl : rawUrl.slice(0, qIdx);
     const queryStr = qIdx === -1 ? '' : rawUrl.slice(qIdx + 1);
@@ -363,13 +369,22 @@ export function createApp(store = new ForgeStore()): AppServer {
     }
 
     // 3. Git Smart HTTP: /:owner/:repo(.git)/(info/refs | git-upload-pack | git-receive-pack)
-    if (!pathname.startsWith('/api/') && pathname !== '/graphql' && pathname !== '/mcp') {
-      const segs = pathname.split('/').filter((s) => s.length > 0);
-      if (segs.length >= 3) {
-        const ownerSeg = safeDecode(segs[0]!);
-        const rawRepoSeg = safeDecode(segs[1]!);
+    if (
+      pathname.charCodeAt(0) === 47 &&
+      !pathname.startsWith('/api/') &&
+      pathname !== '/graphql' &&
+      pathname !== '/mcp'
+    ) {
+      let pStart = 1;
+      while (pathname.charCodeAt(pStart) === 47) pStart++;
+      const s1 = pathname.indexOf('/', pStart);
+      const s2 = s1 > pStart ? pathname.indexOf('/', s1 + 1) : -1;
+      if (s2 > s1 + 1 && s2 + 1 < pathname.length) {
+        const ownerSeg = safeDecode(pathname.slice(pStart, s1));
+        const rawRepoSeg = safeDecode(pathname.slice(s1 + 1, s2));
         const repoNameSeg = rawRepoSeg.endsWith('.git') ? rawRepoSeg.slice(0, -4) : rawRepoSeg;
-        const gitAction = segs.slice(2).join('/');
+        let gitAction = pathname.slice(s2 + 1);
+        if (gitAction.endsWith('/')) gitAction = gitAction.replace(/\/+$/, '');
 
         if (
           gitAction === 'info/refs' ||
@@ -622,7 +637,7 @@ export function createApp(store = new ForgeStore()): AppServer {
         const perPage = Math.min(100, parsePositiveInt(qp.get('per_page'), 30));
         const allRepos = [...store.repos.values()].map(serializeRepoRest);
         const { slice, totalPages } = paginate(allRepos, page, perPage);
-        const link = buildLinkHeader('/api/v3/user/repos', page, perPage, totalPages);
+        const link = buildLinkHeader('/api/v3/user/repos', page, perPage, totalPages, reqHost);
         sendJson(socket, closeConn, 200, slice, link ? `Link: ${link}\r\n` : '');
         return;
       }
@@ -663,7 +678,7 @@ export function createApp(store = new ForgeStore()): AppServer {
         .filter((r) => r.owner === targetUser)
         .map(serializeRepoRest);
       const { slice, totalPages } = paginate(matching, page, perPage);
-      const link = buildLinkHeader(pathname, page, perPage, totalPages);
+      const link = buildLinkHeader(pathname, page, perPage, totalPages, reqHost);
       sendJson(socket, closeConn, 200, slice, link ? `Link: ${link}\r\n` : '');
       return;
     }
@@ -725,6 +740,7 @@ export function createApp(store = new ForgeStore()): AppServer {
           sendError,
           parseJsonBody,
           writeFrame,
+          reqHost,
         );
         return;
       }
@@ -745,6 +761,10 @@ export function createApp(store = new ForgeStore()): AppServer {
 
     let pending: Buffer | null = null;
     let sent100 = false;
+    let cachedPrefix: Buffer | null = null;
+    let cachedTail: Buffer | null = null;
+    let cachedRepo: RepoRecord | null = null;
+    let cachedRepoDelGen = -1;
 
     socket.on('error', () => {
       // 忽略客户端断开导致的 ECONNRESET / EPIPE
@@ -756,7 +776,42 @@ export function createApp(store = new ForgeStore()): AppServer {
     });
 
     socket.on('data', (chunk: Buffer) => {
-      lastRequestActivityMs = performance.now();
+      activityTick = true;
+
+      // TIER 0 ULTRA-FAST PATH: 同一 Keep-Alive 连接上连续 GET issue，仅 2 次定长 memcmp
+      if (
+        pending === null &&
+        cachedPrefix !== null &&
+        cachedTail !== null &&
+        cachedRepo !== null &&
+        cachedRepoDelGen === store.deleteCount
+      ) {
+        const pLen = cachedPrefix.length;
+        const tLen = cachedTail.length;
+        const dLen = chunk.length - pLen - tLen;
+        if (
+          dLen >= 1 &&
+          dLen <= 7 &&
+          chunk.compare(cachedPrefix, 0, pLen, 0, pLen) === 0 &&
+          chunk.compare(cachedTail, 0, tLen, pLen + dLen, chunk.length) === 0
+        ) {
+          let num = 0;
+          let ok = true;
+          for (let i = pLen; i < pLen + dLen; i++) {
+            const b = chunk[i]!;
+            if (b < 48 || b > 57) {
+              ok = false;
+              break;
+            }
+            num = num * 10 + (b - 48);
+          }
+          if (ok && num > 0) {
+            const issue = cachedRepo.issuesByNumber[num];
+            socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
+            return;
+          }
+        }
+      }
 
       // ULTRA-FAST PATH: 单包完整到达的 GET /api/v3/repos/:owner/:repo/issues/:number
       if (pending === null) {
@@ -831,6 +886,10 @@ export function createApp(store = new ForgeStore()): AppServer {
                       socket.write(ERR_404_HTTP_FRAME);
                       return;
                     }
+                    cachedPrefix = Buffer.from(chunk.subarray(0, slash2 + 8));
+                    cachedTail = Buffer.from(chunk.subarray(spaceIdx));
+                    cachedRepo = repo;
+                    cachedRepoDelGen = store.deleteCount;
                     const issue = repo.issuesByNumber[num];
                     socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
                     return;
@@ -971,6 +1030,7 @@ function handleRepoSubroutes(
   sendError: (socket: Socket, closeConn: boolean, status: number, message: string) => void,
   parseJsonBody: (raw: Buffer) => { ok: true; obj: Record<string, unknown> } | { ok: false },
   writeFrame: (socket: Socket, frame: Buffer, closeConn: boolean) => void,
+  reqHost = '127.0.0.1:19999',
 ): void {
   const getParam = (k: string): string | null => qp?.get(k) ?? null;
 
@@ -1391,7 +1451,7 @@ function handleRepoSubroutes(
       }
 
       const { slice, totalPages } = paginate(filtered, page, perPage);
-      const link = buildLinkHeader(pathname, page, perPage, totalPages);
+      const link = buildLinkHeader(pathname, page, perPage, totalPages, reqHost);
       const jsonArrayBuf = Buffer.concat([
         Buffer.from('['),
         ...slice.flatMap((it, idx) => (idx === 0 ? [it.restJsonBuf] : [Buffer.from(','), it.restJsonBuf])),
@@ -1478,7 +1538,7 @@ function handleRepoSubroutes(
         list = list.filter((p) => p.state === stateFilter);
       }
       const { slice, totalPages } = paginate(list, page, perPage);
-      const link = buildLinkHeader(pathname, page, perPage, totalPages);
+      const link = buildLinkHeader(pathname, page, perPage, totalPages, reqHost);
       sendJson(
         socket,
         closeConn,

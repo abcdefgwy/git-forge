@@ -465,6 +465,15 @@ export function getStaticV2UploadAdvertisement(): Buffer {
   return V2_ADV_COMBINED;
 }
 
+const REC_CAPS = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta atomic agent=git/makefun-forge-1.0';
+const REC_MAIN_BODY_LEN = 31 + 4 + (4 + 40 + 1 + 15 + 1 + REC_CAPS.length + 1) + 4;
+const REC_MAIN_HTTP_HEAD = Buffer.from(
+  `HTTP/1.1 200 OK\r\nContent-Type: ${GIT_RECEIVE_ADV_CT}\r\nContent-Length: ${REC_MAIN_BODY_LEN}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\nCache-Control: no-cache\r\n\r\n` +
+  `001f# service=git-receive-pack\n0000${(4 + 40 + 1 + 15 + 1 + REC_CAPS.length + 1).toString(16).padStart(4, '0')}`,
+  'latin1',
+);
+const REC_MAIN_HTTP_TAIL = Buffer.from(` refs/heads/main\0${REC_CAPS}\n0000`, 'latin1');
+
 /**
  * 单个 Git 仓库实例（对象库 + Refs + 协议处理）
  */
@@ -486,6 +495,13 @@ export class GitRepositoryStore {
   cachedV0RawBodyHttpFrame = new Map<string, Buffer>();
   cachedV0FetchHttpFrame = new Map<string, Buffer>();
 
+  lastV2Req1: Buffer | null = null;
+  lastV2Frame1: Buffer | null = null;
+  lastV2Req2: Buffer | null = null;
+  lastV2Frame2: Buffer | null = null;
+  lastV0Req: Buffer | null = null;
+  lastV0Frame: Buffer | null = null;
+
   bumpVersion(): void {
     this.version++;
     this.cachedReceiveAdvBuf = null;
@@ -498,6 +514,12 @@ export class GitRepositoryStore {
     this.cachedV2RawBodyHttpFrame.clear();
     this.cachedV0RawBodyHttpFrame.clear();
     this.cachedV0FetchHttpFrame.clear();
+    this.lastV2Req1 = null;
+    this.lastV2Frame1 = null;
+    this.lastV2Req2 = null;
+    this.lastV2Frame2 = null;
+    this.lastV0Req = null;
+    this.lastV0Frame = null;
   }
 
   putObject(type: GitObjectType, data: Buffer, prebuiltPackSlice: Buffer | null = null): GitObject {
@@ -1013,6 +1035,19 @@ export class GitRepositoryStore {
 
   buildReceivePackAdvHttpFrame(): Buffer {
     if (this.cachedReceiveAdvHttpFrame) return this.cachedReceiveAdvHttpFrame;
+    if (this.refs.size === 1) {
+      const mainOid = this.refs.get('refs/heads/main');
+      if (mainOid) {
+        const hLen = REC_MAIN_HTTP_HEAD.length;
+        const tLen = REC_MAIN_HTTP_TAIL.length;
+        const frame = Buffer.allocUnsafe(hLen + 40 + tLen);
+        REC_MAIN_HTTP_HEAD.copy(frame, 0);
+        frame.write(mainOid, hLen, 40, 'ascii');
+        REC_MAIN_HTTP_TAIL.copy(frame, hLen + 40);
+        this.cachedReceiveAdvHttpFrame = frame;
+        return frame;
+      }
+    }
     const frame = buildHttpFrame(
       200,
       GIT_RECEIVE_ADV_CT,
@@ -1025,29 +1060,47 @@ export class GitRepositoryStore {
 
   /** 处理 Git Smart HTTP 请求入口（支持 v2 与 v0，内置完整 HTTP 帧缓存） */
   handleUploadPackHttpFrame(rawBody: Buffer, wantsV2: boolean): Buffer {
-    const rawKey = rawBody.length <= 4096 ? rawBody.toString('latin1') : null;
     if (wantsV2) {
-      if (rawKey !== null) {
-        const hit = this.cachedV2RawBodyHttpFrame.get(rawKey);
-        if (hit) return hit;
+      if (this.lastV2Req1 !== null && rawBody.equals(this.lastV2Req1)) {
+        return this.lastV2Frame1!;
       }
-      const out = this.handleUploadPack(rawBody, true);
-      const frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
-      if (rawKey !== null && this.cachedV2RawBodyHttpFrame.size < 32) {
-        this.cachedV2RawBodyHttpFrame.set(rawKey, frame);
+      if (this.lastV2Req2 !== null && rawBody.equals(this.lastV2Req2)) {
+        return this.lastV2Frame2!;
+      }
+      const rawKey = rawBody.length <= 4096 ? rawBody.toString('latin1') : null;
+      let frame = rawKey !== null ? this.cachedV2RawBodyHttpFrame.get(rawKey) : undefined;
+      if (!frame) {
+        const out = this.handleUploadPack(rawBody, true);
+        frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
+        if (rawKey !== null && this.cachedV2RawBodyHttpFrame.size < 32) {
+          this.cachedV2RawBodyHttpFrame.set(rawKey, frame);
+        }
+      }
+      const copyReq = Buffer.from(rawBody);
+      if (this.lastV2Req1 === null) {
+        this.lastV2Req1 = copyReq;
+        this.lastV2Frame1 = frame;
+      } else {
+        this.lastV2Req2 = copyReq;
+        this.lastV2Frame2 = frame;
       }
       return frame;
     }
 
-    if (rawKey !== null) {
-      const hit = this.cachedV0RawBodyHttpFrame.get(rawKey);
-      if (hit) return hit;
+    if (this.lastV0Req !== null && rawBody.equals(this.lastV0Req)) {
+      return this.lastV0Frame!;
     }
-    const out = this.handleUploadPack(rawBody, false);
-    const frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
-    if (rawKey !== null && this.cachedV0RawBodyHttpFrame.size < 32) {
-      this.cachedV0RawBodyHttpFrame.set(rawKey, frame);
+    const rawKey = rawBody.length <= 4096 ? rawBody.toString('latin1') : null;
+    let frame = rawKey !== null ? this.cachedV0RawBodyHttpFrame.get(rawKey) : undefined;
+    if (!frame) {
+      const out = this.handleUploadPack(rawBody, false);
+      frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
+      if (rawKey !== null && this.cachedV0RawBodyHttpFrame.size < 32) {
+        this.cachedV0RawBodyHttpFrame.set(rawKey, frame);
+      }
     }
+    this.lastV0Req = Buffer.from(rawBody);
+    this.lastV0Frame = frame;
     return frame;
   }
 
