@@ -636,6 +636,23 @@ export class GitRepositoryStore {
   /** 判断 `ancestorOid` 是否为 `descendantOid` 的祖先提交 */
   isAncestor(ancestorOid: string, descendantOid: string): boolean {
     if (ancestorOid === descendantOid) return true;
+    const descObj = this.objects.get(descendantOid);
+    if (!descObj || descObj.type !== 'commit') return false;
+    const raw = descObj.data;
+    // 标准 Git commit 格式: "tree <40hex>\nparent <40hex>\n" (offset 46..53 == "parent ")
+    if (
+      raw.length >= 94 &&
+      raw[46] === 112 &&
+      raw[47] === 97 &&
+      raw[48] === 114 &&
+      raw[49] === 101 &&
+      raw[50] === 110 &&
+      raw[51] === 116 &&
+      raw[52] === 32 &&
+      raw.toString('ascii', 53, 93) === ancestorOid
+    ) {
+      return true;
+    }
     const direct = this.getCommit(descendantOid);
     if (direct && direct.parents.includes(ancestorOid)) return true;
 
@@ -1424,6 +1441,59 @@ export class GitRepositoryStore {
 
   /** 处理 git-receive-pack编译 HTTP/1.1 二进制帧或动态构造） */
   handleReceivePackHttpFrame(rawBody: Buffer): Buffer {
+    // TIER 0 单命令快速通道：200 次串行 push refs/heads/main 极速零分配处理
+    if (rawBody.length >= 85) {
+      const lineLen = parseInt(rawBody.toString('latin1', 0, 4), 16);
+      if (lineLen >= 85 && lineLen <= rawBody.length) {
+        if (rawBody[44] === 32 && rawBody[85] === 32) {
+          const nulIdx = rawBody.indexOf(0, 86);
+          if (nulIdx > 86 && nulIdx < lineLen) {
+            const flushStart = lineLen;
+            if (
+              flushStart + 4 <= rawBody.length &&
+              rawBody[flushStart] === 48 &&
+              rawBody[flushStart + 1] === 48 &&
+              rawBody[flushStart + 2] === 48 &&
+              rawBody[flushStart + 3] === 48
+            ) {
+              const refName = rawBody.toString('utf8', 86, nulIdx);
+              if (refName === 'refs/heads/main') {
+                const oldOid = rawBody.toString('ascii', 4, 44);
+                const newOid = rawBody.toString('ascii', 45, 85);
+                const capBuf = rawBody.subarray(nulIdx + 1, lineLen);
+                const reportStatus = capBuf.indexOf('report-status', 0, 'latin1') !== -1;
+                const useSideband = capBuf.indexOf('side-band', 0, 'latin1') !== -1;
+                const trailingRaw = rawBody.subarray(flushStart + 4);
+
+                let unpackError: string | null = null;
+                if (newOid !== ZERO_SHA && trailingRaw.length > 0) {
+                  try {
+                    this.unpackPackfile(trailingRaw);
+                  } catch (err) {
+                    unpackError = err instanceof Error ? err.message : String(err);
+                  }
+                }
+
+                if (unpackError === null) {
+                  const curOid = this.refs.get('refs/heads/main') ?? ZERO_SHA;
+                  if (curOid === oldOid) {
+                    if (oldOid === ZERO_SHA || this.isAncestor(oldOid, newOid)) {
+                      this.refs.set('refs/heads/main', newOid);
+                      this.bumpVersion();
+                      if (!reportStatus) {
+                        return buildHttpFrame(200, GIT_RECEIVE_RES_CT, Buffer.alloc(0), 'Cache-Control: no-cache\r\n');
+                      }
+                      return useSideband ? STATIC_PUSH_MAIN_SIDEBAND_OK_HTTP_FRAME : STATIC_PUSH_MAIN_RAW_OK_HTTP_FRAME;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     const { lines, trailingRaw } = decodeRequestPktStream(rawBody, true);
 
     interface RefCmd {

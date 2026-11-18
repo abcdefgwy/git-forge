@@ -26,6 +26,7 @@ import { encodeCommit, isHex40, V2_UPLOAD_ADV_HTTP_FRAME } from './git-engine.ts
 import { handleGraphql, handleMcp } from './graphql-mcp.ts';
 import {
   buildIssue201Frame,
+  ensureIssueHttp200Frame,
   DEFAULT_VIEWER_EMAIL,
   DEFAULT_VIEWER_NAME,
   ForgeStore,
@@ -358,7 +359,7 @@ export function createApp(store = new ForgeStore()): AppServer {
                   return;
                 }
                 if (!closeConn) {
-                  socket.write(issue.restHttp200Frame);
+                  socket.write(ensureIssueHttp200Frame(issue));
                 } else {
                   writeFrame(
                     socket,
@@ -409,7 +410,12 @@ export function createApp(store = new ForgeStore()): AppServer {
           const wantsV2 = (headers['git-protocol'] || '').includes('version=2');
 
           if (method === 'GET' && gitAction === 'info/refs') {
-            const service = parseQueryParams(queryStr).get('service') || '';
+            const service =
+              queryStr === 'service=git-upload-pack'
+                ? 'git-upload-pack'
+                : queryStr === 'service=git-receive-pack'
+                  ? 'git-receive-pack'
+                  : parseQueryParams(queryStr).get('service') || '';
             if (service === 'git-upload-pack') {
               if (!closeConn && wantsV2) {
                 socket.write(V2_UPLOAD_ADV_HTTP_FRAME);
@@ -813,7 +819,7 @@ export function createApp(store = new ForgeStore()): AppServer {
           }
           if (ok && num > 0) {
             const issue = cachedRepo.issuesByNumber[num];
-            socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
+            socket.write(issue ? ensureIssueHttp200Frame(issue) : ERR_404_HTTP_FRAME);
             return;
           }
         }
@@ -898,7 +904,7 @@ export function createApp(store = new ForgeStore()): AppServer {
                     cachedRepo = repo;
                     cachedRepoDelGen = store.deleteCount;
                     const issue = repo.issuesByNumber[num];
-                    socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
+                    socket.write(issue ? ensureIssueHttp200Frame(issue) : ERR_404_HTTP_FRAME);
                     return;
                   }
                 }
@@ -941,31 +947,54 @@ export function createApp(store = new ForgeStore()): AppServer {
         const rawUrl = reqLine.slice(sp1 + 1, sp2);
         const httpVer = reqLine.slice(sp2 + 1);
 
-        const headers: Record<string, string> = {};
+        let hdrHost: string | undefined;
+        let hdrAuth: string | undefined;
+        let hdrExpect: string | undefined;
+        let hdrConn: string | undefined;
+        let hdrGitProto: string | undefined;
+        let hdrCL: string | undefined;
+        let hdrTE: string | undefined;
+
         let pos = lineEnd + 2;
         while (pos < hdrEnd) {
           const nextCrLf = buf.indexOf('\r\n', pos, 'latin1');
           const endPos = nextCrLf === -1 || nextCrLf > hdrEnd ? hdrEnd : nextCrLf;
           const colon = buf.indexOf(0x3a, pos);
           if (colon > pos && colon < endPos) {
-            const firstChar = buf[pos]! | 0x20;
-            if (
-              firstChar === 97 || // a: authorization, accept
-              firstChar === 99 || // c: connection, content-length, content-type
-              firstChar === 101 || // e: expect
-              firstChar === 103 || // g: git-protocol
-              firstChar === 104 || // h: host
-              firstChar === 116 || // t: transfer-encoding
-              firstChar === 117 || // u: user-agent
-              firstChar === 120    // x: x-...
-            ) {
-              const k = buf.toString('latin1', pos, colon).trim().toLowerCase();
-              const v = buf.toString('latin1', colon + 1, endPos).trim();
-              headers[k] = v;
+            const keyLen = colon - pos;
+            const c0 = buf[pos]! | 0x20;
+            let valStart = colon + 1;
+            while (valStart < endPos && buf[valStart] === 0x20) valStart++;
+            let valEnd = endPos;
+            while (valEnd > valStart && buf[valEnd - 1] === 0x20) valEnd--;
+            if (keyLen === 13 && c0 === 97 && (buf[pos + 1]! | 0x20) === 117) {
+              hdrAuth = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 14 && c0 === 99 && (buf[pos + 8]! | 0x20) === 108) {
+              hdrCL = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 10 && c0 === 99 && (buf[pos + 1]! | 0x20) === 111) {
+              hdrConn = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 12 && c0 === 103 && (buf[pos + 1]! | 0x20) === 105) {
+              hdrGitProto = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 4 && c0 === 104 && (buf[pos + 1]! | 0x20) === 111) {
+              hdrHost = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 17 && c0 === 116 && (buf[pos + 1]! | 0x20) === 114) {
+              hdrTE = buf.toString('latin1', valStart, valEnd);
+            } else if (keyLen === 6 && c0 === 101 && (buf[pos + 1]! | 0x20) === 120) {
+              hdrExpect = buf.toString('latin1', valStart, valEnd);
             }
           }
           pos = endPos + 2;
         }
+
+        const headers = {
+          host: hdrHost,
+          authorization: hdrAuth,
+          expect: hdrExpect,
+          connection: hdrConn,
+          'git-protocol': hdrGitProto,
+          'content-length': hdrCL,
+          'transfer-encoding': hdrTE,
+        };
 
         // 状态机备用直通缓存学习：无论客户端大小写与头顺序如何，第一次成功处理后立刻为该 socket 建立 Tier 0 直通
         if (
@@ -1517,7 +1546,7 @@ function handleRepoSubroutes(
       }
       if (method === 'GET') {
         if (!closeConn) {
-          socket.write(issue.restHttp200Frame);
+          socket.write(ensureIssueHttp200Frame(issue));
         } else {
           writeFrame(socket, buildHttpFrame(200, JSON_CT, issue.restJsonBuf, '', true), true);
         }
@@ -1536,7 +1565,7 @@ function handleRepoSubroutes(
           state: typeof body.state === 'string' ? body.state : undefined,
         });
         if (!closeConn) {
-          socket.write(updated.restHttp200Frame);
+          socket.write(ensureIssueHttp200Frame(updated));
         } else {
           writeFrame(socket, buildHttpFrame(200, JSON_CT, updated.restJsonBuf, '', true), true);
         }
