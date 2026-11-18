@@ -186,6 +186,12 @@ export function createApp(store = new ForgeStore()): AppServer {
   const expectedBearerLineMixed = configuredToken
     ? Buffer.from(`\r\nauthorization: Bearer ${configuredToken}\r\n`, 'latin1')
     : null;
+  const expectedTokenLineUpper = configuredToken
+    ? Buffer.from(`\r\nAuthorization: token ${configuredToken}\r\n`, 'latin1')
+    : null;
+  const expectedTokenLineLower = configuredToken
+    ? Buffer.from(`\r\nauthorization: token ${configuredToken}\r\n`, 'latin1')
+    : null;
 
   // 单条目最近仓库缓存，配合 store.deleteCount 保持 100% 强一致
   let lastRepo: RepoRecord | null = null;
@@ -877,7 +883,9 @@ export function createApp(store = new ForgeStore()): AppServer {
                   const authOk =
                     (expectedBearerLineUpper !== null && chunk.indexOf(expectedBearerLineUpper, firstHdrStart - 2) !== -1) ||
                     (expectedBearerLineLower !== null && chunk.indexOf(expectedBearerLineLower, firstHdrStart - 2) !== -1) ||
-                    (expectedBearerLineMixed !== null && chunk.indexOf(expectedBearerLineMixed, firstHdrStart - 2) !== -1);
+                    (expectedBearerLineMixed !== null && chunk.indexOf(expectedBearerLineMixed, firstHdrStart - 2) !== -1) ||
+                    (expectedTokenLineUpper !== null && chunk.indexOf(expectedTokenLineUpper, firstHdrStart - 2) !== -1) ||
+                    (expectedTokenLineLower !== null && chunk.indexOf(expectedTokenLineLower, firstHdrStart - 2) !== -1);
 
                   if (authOk) {
                     let repo: RepoRecord | undefined;
@@ -996,33 +1004,6 @@ export function createApp(store = new ForgeStore()): AppServer {
           'transfer-encoding': hdrTE,
         };
 
-        // 状态机备用直通缓存学习：无论客户端大小写与头顺序如何，第一次成功处理后立刻为该 socket 建立 Tier 0 直通
-        if (
-          cachedPrefix === null &&
-          method === 'GET' &&
-          rawUrl.startsWith('/api/v3/repos/')
-        ) {
-          const issuesIdx = rawUrl.indexOf('/issues/');
-          if (issuesIdx > 14 && sp2 > sp1 + 1) {
-            const numStr = rawUrl.slice(issuesIdx + 8);
-            if (/^\d+$/.test(numStr)) {
-              const rest = rawUrl.slice(14, issuesIdx);
-              const slashMid = rest.indexOf('/');
-              if (slashMid > 0) {
-                const owner = safeDecode(rest.slice(0, slashMid));
-                const repoName = safeDecode(rest.slice(slashMid + 1));
-                const repo = store.getRepo(owner, repoName);
-                if (repo && checkAuth(headers.authorization)) {
-                  cachedPrefix = Buffer.from(buf.subarray(offset, offset + sp1 + 1 + issuesIdx + 8));
-                  cachedTail = Buffer.from(buf.subarray(offset + sp2, hdrEnd + 4));
-                  cachedRepo = repo;
-                  cachedRepoDelGen = store.deleteCount;
-                }
-              }
-            }
-          }
-        }
-
         if (!sent100 && headers.expect && headers.expect.toLowerCase() === '100-continue') {
           socket.write(CONTINUE_100_BUF);
           sent100 = true;
@@ -1067,6 +1048,55 @@ export function createApp(store = new ForgeStore()): AppServer {
         }
 
         sent100 = false;
+
+        // 状态机备用直通缓存学习：严格遵循 2 大安全前提 (!closeConn && nextOffset === hdrEnd + 4 && 无 query 参数)，
+        // 且直接在 buf 上通过字节偏移定位 /issues/，防止多字节字符或特殊参数污染后续直通
+        if (
+          cachedPrefix === null &&
+          method === 'GET' &&
+          !closeConn &&
+          nextOffset === hdrEnd + 4 &&
+          rawUrl.indexOf('?') === -1
+        ) {
+          const urlByteStart = offset + sp1 + 1;
+          const bufIssuesIdx = buf.indexOf('/issues/', urlByteStart, 'latin1');
+          const numByteStart = bufIssuesIdx + 8;
+          const numByteEnd = offset + sp2;
+          if (bufIssuesIdx > urlByteStart && numByteEnd > numByteStart) {
+            let allDigits = true;
+            for (let i = numByteStart; i < numByteEnd; i++) {
+              const b = buf[i]!;
+              if (b < 48 || b > 57) {
+                allDigits = false;
+                break;
+              }
+            }
+            if (allDigits) {
+              const issuesIdx = rawUrl.indexOf('/issues/');
+              let repoPath = '';
+              if (rawUrl.startsWith('/api/v3/repos/')) {
+                repoPath = rawUrl.slice(14, issuesIdx);
+              } else if (rawUrl.startsWith('/repos/')) {
+                repoPath = rawUrl.slice(7, issuesIdx);
+              }
+              if (repoPath) {
+                const slashMid = repoPath.indexOf('/');
+                if (slashMid > 0) {
+                  const owner = safeDecode(repoPath.slice(0, slashMid));
+                  const repoName = safeDecode(repoPath.slice(slashMid + 1));
+                  const repo = store.getRepo(owner, repoName);
+                  if (repo && checkAuth(headers.authorization)) {
+                    cachedPrefix = Buffer.from(buf.subarray(offset, numByteStart));
+                    cachedTail = Buffer.from(buf.subarray(numByteEnd, hdrEnd + 4));
+                    cachedRepo = repo;
+                    cachedRepoDelGen = store.deleteCount;
+                  }
+                }
+              }
+            }
+          }
+        }
+
         offset = nextOffset;
 
         dispatchRequest(socket, method, rawUrl, headers, rawBody, closeConn);
