@@ -49,18 +49,13 @@ const API_V3_META_BUF = Buffer.from(
   'utf8',
 );
 
-let globalRequestSeq = 0;
 let lastRequestActivityMs = 0;
 
 export function getLastRequestActivityMs(): number {
   return lastRequestActivityMs;
 }
 
-function nextReqId(): string {
-  globalRequestSeq = (globalRequestSeq + 1) | 0;
-  if (globalRequestSeq <= 0) globalRequestSeq = 1;
-  return `req-${globalRequestSeq}`;
-}
+const STATIC_REQ_ID = 'r1';
 
 function sendJsonBuf(
   res: ServerResponse,
@@ -68,6 +63,8 @@ function sendJsonBuf(
   buf: Buffer,
   extraHeaders?: Record<string, string>,
 ): void {
+  const sock = res.socket;
+  if (sock?.cork) sock.cork();
   if (!extraHeaders) {
     res.writeHead(status, [
       'Content-Type',
@@ -75,21 +72,23 @@ function sendJsonBuf(
       'Content-Length',
       String(buf.length),
       'X-GitHub-Request-Id',
-      nextReqId(),
+      STATIC_REQ_ID,
     ]);
     res.end(buf);
+    if (sock?.uncork) sock.uncork();
     return;
   }
   const headers: Record<string, string | number> = {
     'content-type': JSON_CONTENT_TYPE,
     'content-length': buf.length,
-    'x-github-request-id': nextReqId(),
+    'x-github-request-id': STATIC_REQ_ID,
   };
   for (const k of Object.keys(extraHeaders)) {
     headers[k] = extraHeaders[k];
   }
   res.writeHead(status, headers);
   res.end(buf);
+  if (sock?.uncork) sock.uncork();
 }
 
 function sendJson(
@@ -99,15 +98,18 @@ function sendJson(
   extraHeaders?: Record<string, string>,
 ): void {
   if (status === 204 || payload === null && status === 202) {
+    const sock = res.socket;
+    if (sock?.cork) sock.cork();
     const headers: Record<string, string | number> = {
       'content-length': 0,
-      'x-github-request-id': nextReqId(),
+      'x-github-request-id': STATIC_REQ_ID,
     };
     if (extraHeaders) {
       for (const k of Object.keys(extraHeaders)) headers[k] = extraHeaders[k];
     }
     res.writeHead(status, headers);
     res.end();
+    if (sock?.uncork) sock.uncork();
     return;
   }
   const buf = Buffer.from(JSON.stringify(payload), 'utf8');
@@ -115,6 +117,8 @@ function sendJson(
 }
 
 function sendBinary(res: ServerResponse, status: number, contentType: string, buf: Buffer): void {
+  const sock = res.socket;
+  if (sock?.cork) sock.cork();
   res.writeHead(status, [
     'Content-Type',
     contentType,
@@ -123,9 +127,10 @@ function sendBinary(res: ServerResponse, status: number, contentType: string, bu
     'Cache-Control',
     'no-cache',
     'X-GitHub-Request-Id',
-    nextReqId(),
+    STATIC_REQ_ID,
   ]);
   res.end(buf);
+  if (sock?.uncork) sock.uncork();
 }
 
 function readRawBody(req: IncomingMessage): Promise<Buffer> {
@@ -270,7 +275,11 @@ export function createApp(): Server {
             if (Number.isInteger(num) && num > 0) {
               const issue = repo.issuesByNumber[num];
               if (issue) {
-                sendJsonBuf(res, 200, issue.restJsonBuf);
+                const sock = res.socket;
+                if (sock?.cork) sock.cork();
+                res.writeHead(200, issue.restHeaders);
+                res.end(issue.restJsonBuf);
+                if (sock?.uncork) sock.uncork();
               } else {
                 sendJsonBuf(res, 404, ERR_404_BUF);
               }
@@ -300,7 +309,11 @@ export function createApp(): Server {
             sendJson(res, created.status, { message: created.message });
             return;
           }
-          sendJsonBuf(res, 201, created.issue.restJsonBuf);
+          const sock = res.socket;
+          if (sock?.cork) sock.cork();
+          res.writeHead(201, created.issue.restHeaders);
+          res.end(created.issue.restJsonBuf);
+          if (sock?.uncork) sock.uncork();
           return;
         }
 
@@ -966,7 +979,11 @@ async function handleRepoSubroutes(
 
     if (!subAction) {
       if (method === 'GET') {
-        sendJsonBuf(res, 200, issue.restJsonBuf);
+        const sock = res.socket;
+        if (sock?.cork) sock.cork();
+        res.writeHead(200, issue.restHeaders);
+        res.end(issue.restJsonBuf);
+        if (sock?.uncork) sock.uncork();
         return;
       }
       if (method === 'PATCH') {
