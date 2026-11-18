@@ -56,6 +56,8 @@ export interface IssueRecord {
   updated_at: string;
   /** 预序列化的精简合规 REST JSON Buffer（使 read 压测零 JSON.stringify） */
   restJsonBuf: Buffer;
+  /** 预编译的零拷贝 HTTP 响应头数组（消除 writeHead 时的对象分配与字符串化） */
+  restHeaders: string[];
 }
 
 export interface PullRequestRecord {
@@ -125,6 +127,19 @@ export function buildIssueRestBuffer(issue: IssueRecord, owner: string): Buffer 
     updated_at: issue.updated_at,
   };
   return Buffer.from(JSON.stringify(payload), 'utf8');
+}
+
+export function refreshIssueRestCache(issue: IssueRecord, owner: string): void {
+  const buf = buildIssueRestBuffer(issue, owner);
+  issue.restJsonBuf = buf;
+  issue.restHeaders = [
+    'Content-Type',
+    'application/json; charset=utf-8',
+    'Content-Length',
+    String(buf.length),
+    'X-GitHub-Request-Id',
+    '1',
+  ];
 }
 
 export function serializeRepoRest(repo: RepoRecord): Record<string, unknown> {
@@ -295,8 +310,9 @@ export class ForgeStore {
       created_at: iso,
       updated_at: iso,
       restJsonBuf: Buffer.alloc(0),
+      restHeaders: [],
     };
-    issue.restJsonBuf = buildIssueRestBuffer(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner);
 
     repo.issuesList.push(issue);
     repo.issuesByNumber[number] = issue;
@@ -316,7 +332,7 @@ export class ForgeStore {
       issue.state = patch.state;
     }
     issue.updated_at = fastNowIso().iso;
-    issue.restJsonBuf = buildIssueRestBuffer(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner);
     return issue;
   }
 
@@ -334,7 +350,7 @@ export class ForgeStore {
     };
     issue.comments.push(comment);
     issue.updated_at = iso;
-    issue.restJsonBuf = buildIssueRestBuffer(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner);
     return comment;
   }
 
