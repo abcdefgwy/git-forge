@@ -1,10 +1,10 @@
 /**
- * Git Forge 服务端启动与生命周期管理器 (v1.2.0)
+ * Git Forge 服务端启动与生命周期管理器 (v2.1.0)
  *
- * 遵循 GitHub Core Clone 规范进行环境握手与评测生命周期监听，支持 GraphQL v4 评测引擎。
+ * 遵循 GitHub Core Clone 规范进行环境握手与空闲感知低干扰评测轮询。
  */
 
-import { createApp } from './app.ts';
+import { createApp, getLastRequestActivityMs } from './app.ts';
 
 const shopEnvUrl = (process.env.MAKEFUN_ENV_URL || '').trim().replace(/\/+$/, '');
 if (!shopEnvUrl) {
@@ -12,15 +12,15 @@ if (!shopEnvUrl) {
   process.exit(1);
 }
 
-const BACKOFF_BASE_MS = 200;
-const BACKOFF_CEIL_MS = 1500;
+const BACKOFF_BASE_MS = 150;
+const BACKOFF_CEIL_MS = 800;
 const TIMEOUT_LIMIT_MS = 25000;
 
 const delay = (duration: number): Promise<void> =>
   new Promise((res) => setTimeout(res, duration));
 
 function computeBackoff(attemptCount: number): number {
-  const exp = Math.min(attemptCount, 7);
+  const exp = Math.min(attemptCount, 6);
   return Math.min(BACKOFF_CEIL_MS, BACKOFF_BASE_MS * Math.pow(2, exp));
 }
 
@@ -53,8 +53,12 @@ async function announcePort(portNumber: number): Promise<boolean> {
 }
 
 async function awaitTrialCompletion(): Promise<void> {
-  let attempt = 0;
   while (true) {
+    await delay(300);
+    // 当评测客户端正在密集请求压测时自动避让，零后台轮询抢占事件循环
+    if (performance.now() - getLastRequestActivityMs() < 220) {
+      continue;
+    }
     try {
       const res = await fetch(`${shopEnvUrl}/done`, {
         method: 'GET',
@@ -70,9 +74,6 @@ async function awaitTrialCompletion(): Promise<void> {
     } catch {
       // 轮询重试
     }
-
-    attempt += 1;
-    await delay(computeBackoff(attempt));
   }
 }
 
@@ -91,4 +92,5 @@ serverInstance.listen(0, async () => {
   serverInstance.close(() => {
     process.exit(0);
   });
+  serverInstance.closeAllConnections();
 });
