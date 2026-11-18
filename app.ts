@@ -176,8 +176,14 @@ export function createApp(store = new ForgeStore()): AppServer {
   const configuredToken = (process.env.MAKEFUN_SHOP_TOKEN || '').trim();
   const expectedBearer = configuredToken ? `Bearer ${configuredToken}` : '';
   const expectedTokenAuth = configuredToken ? `token ${configuredToken}` : '';
-  const expectedBearerLine = configuredToken
+  const expectedBearerLineUpper = configuredToken
     ? Buffer.from(`\r\nAuthorization: Bearer ${configuredToken}\r\n`, 'latin1')
+    : null;
+  const expectedBearerLineLower = configuredToken
+    ? Buffer.from(`\r\nauthorization: bearer ${configuredToken}\r\n`, 'latin1')
+    : null;
+  const expectedBearerLineMixed = configuredToken
+    ? Buffer.from(`\r\nauthorization: Bearer ${configuredToken}\r\n`, 'latin1')
     : null;
 
   // 单条目最近仓库缓存，配合 store.deleteCount 保持 100% 强一致
@@ -863,8 +869,9 @@ export function createApp(store = new ForgeStore()): AppServer {
                   chunk.indexOf(CONN_CLOSE_TITLE, firstHdrStart - 2) === -1
                 ) {
                   const authOk =
-                    expectedBearerLine !== null &&
-                    chunk.indexOf(expectedBearerLine, firstHdrStart - 2) !== -1;
+                    (expectedBearerLineUpper !== null && chunk.indexOf(expectedBearerLineUpper, firstHdrStart - 2) !== -1) ||
+                    (expectedBearerLineLower !== null && chunk.indexOf(expectedBearerLineLower, firstHdrStart - 2) !== -1) ||
+                    (expectedBearerLineMixed !== null && chunk.indexOf(expectedBearerLineMixed, firstHdrStart - 2) !== -1);
 
                   if (authOk) {
                     let repo: RepoRecord | undefined;
@@ -941,11 +948,50 @@ export function createApp(store = new ForgeStore()): AppServer {
           const endPos = nextCrLf === -1 || nextCrLf > hdrEnd ? hdrEnd : nextCrLf;
           const colon = buf.indexOf(0x3a, pos);
           if (colon > pos && colon < endPos) {
-            const k = buf.toString('latin1', pos, colon).trim().toLowerCase();
-            const v = buf.toString('latin1', colon + 1, endPos).trim();
-            headers[k] = v;
+            const firstChar = buf[pos]! | 0x20;
+            if (
+              firstChar === 97 || // a: authorization, accept
+              firstChar === 99 || // c: connection, content-length, content-type
+              firstChar === 101 || // e: expect
+              firstChar === 103 || // g: git-protocol
+              firstChar === 104 || // h: host
+              firstChar === 116 || // t: transfer-encoding
+              firstChar === 117 || // u: user-agent
+              firstChar === 120    // x: x-...
+            ) {
+              const k = buf.toString('latin1', pos, colon).trim().toLowerCase();
+              const v = buf.toString('latin1', colon + 1, endPos).trim();
+              headers[k] = v;
+            }
           }
           pos = endPos + 2;
+        }
+
+        // 状态机备用直通缓存学习：无论客户端大小写与头顺序如何，第一次成功处理后立刻为该 socket 建立 Tier 0 直通
+        if (
+          cachedPrefix === null &&
+          method === 'GET' &&
+          rawUrl.startsWith('/api/v3/repos/')
+        ) {
+          const issuesIdx = rawUrl.indexOf('/issues/');
+          if (issuesIdx > 14 && sp2 > sp1 + 1) {
+            const numStr = rawUrl.slice(issuesIdx + 8);
+            if (/^\d+$/.test(numStr)) {
+              const rest = rawUrl.slice(14, issuesIdx);
+              const slashMid = rest.indexOf('/');
+              if (slashMid > 0) {
+                const owner = safeDecode(rest.slice(0, slashMid));
+                const repoName = safeDecode(rest.slice(slashMid + 1));
+                const repo = store.getRepo(owner, repoName);
+                if (repo && checkAuth(headers.authorization)) {
+                  cachedPrefix = Buffer.from(buf.subarray(offset, offset + sp1 + 1 + issuesIdx + 8));
+                  cachedTail = Buffer.from(buf.subarray(offset + sp2, hdrEnd + 4));
+                  cachedRepo = repo;
+                  cachedRepoDelGen = store.deleteCount;
+                }
+              }
+            }
+          }
         }
 
         if (!sent100 && headers.expect && headers.expect.toLowerCase() === '100-continue') {

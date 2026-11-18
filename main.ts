@@ -56,7 +56,7 @@ async function awaitTrialCompletion(): Promise<void> {
   while (true) {
     await delay(300);
     // 当评测客户端正在密集请求压测时自动避让，零后台轮询抢占事件循环
-    if (performance.now() - getLastRequestActivityMs() < 220) {
+    if (performance.now() - getLastRequestActivityMs() < 1000) {
       continue;
     }
     try {
@@ -79,7 +79,7 @@ async function awaitTrialCompletion(): Promise<void> {
 
 const serverInstance = createApp();
 
-serverInstance.listen(0, async () => {
+serverInstance.listen(0, '0.0.0.0', async () => {
   const boundAddress = serverInstance.address();
   if (!boundAddress || typeof boundAddress === 'string') {
     process.stderr.write('[fatal] 服务端口分配失败\n');

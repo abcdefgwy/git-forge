@@ -69,6 +69,8 @@ export interface IssueRecord {
   restJsonBuf: Buffer;
   /** 预编译的完整 HTTP/1.1 200 OK Keep-Alive 二进制响应帧 */
   restHttp200Frame: Buffer;
+  /** 预编译的完整 HTTP/1.1 201 Created Keep-Alive 二进制响应帧 */
+  restHttp201Frame: Buffer;
   /** 兼容保留字段 */
   restHeaders: string[];
 }
@@ -148,30 +150,31 @@ export function buildIssueRestBuffer(issue: IssueRecord, owner: string): Buffer 
 }
 
 export function buildIssue201Frame(issue: IssueRecord): Buffer {
-  const body = issue.restJsonBuf;
-  const hdr =
-    `HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\n` +
-    `Content-Length: ${body.length}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\n\r\n`;
-  const hdrLen = Buffer.byteLength(hdr, 'latin1');
-  const frame = Buffer.allocUnsafe(hdrLen + body.length);
-  frame.write(hdr, 0, hdrLen, 'latin1');
-  body.copy(frame, hdrLen);
-  return frame;
+  return issue.restHttp201Frame;
 }
 
 export function refreshIssueRestCache(issue: IssueRecord, owner: string, ownerJson?: string): void {
   const jsonStr = buildIssueJsonString(issue, owner, ownerJson ?? JSON.stringify(owner));
   const bodyLen = Buffer.byteLength(jsonStr, 'utf8');
-  const hdr =
+  const hdr200 =
     `HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n` +
     `Content-Length: ${bodyLen}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\n\r\n`;
-  const hdrLen = Buffer.byteLength(hdr, 'latin1');
-  const frame200 = Buffer.allocUnsafe(hdrLen + bodyLen);
-  frame200.write(hdr, 0, hdrLen, 'latin1');
-  frame200.write(jsonStr, hdrLen, bodyLen, 'utf8');
+  const hdr200Len = Buffer.byteLength(hdr200, 'latin1');
+  const frame200 = Buffer.allocUnsafe(hdr200Len + bodyLen);
+  frame200.write(hdr200, 0, hdr200Len, 'latin1');
+  frame200.write(jsonStr, hdr200Len, bodyLen, 'utf8');
+
+  const hdr201 =
+    `HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\n` +
+    `Content-Length: ${bodyLen}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\n\r\n`;
+  const hdr201Len = Buffer.byteLength(hdr201, 'latin1');
+  const frame201 = Buffer.allocUnsafe(hdr201Len + bodyLen);
+  frame201.write(hdr201, 0, hdr201Len, 'latin1');
+  frame200.copy(frame201, hdr201Len, hdr200Len);
 
   issue.restHttp200Frame = frame200;
-  issue.restJsonBuf = frame200.subarray(hdrLen);
+  issue.restHttp201Frame = frame201;
+  issue.restJsonBuf = frame200.subarray(hdr200Len);
   issue.restHeaders = [
     'Content-Type',
     'application/json; charset=utf-8',
@@ -363,6 +366,7 @@ export class ForgeStore {
       updated_at: iso,
       restJsonBuf: EMPTY_BUF,
       restHttp200Frame: EMPTY_BUF,
+      restHttp201Frame: EMPTY_BUF,
       restHeaders: [],
     };
     refreshIssueRestCache(issue, repo.owner, repo.ownerJson);
