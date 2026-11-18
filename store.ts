@@ -1,8 +1,8 @@
 /**
- * Git Forge 统一存储层与预序列化实体模型 (v2.0.0)
+ * Git Forge 统一存储层与预序列化实体模型 (v2.1.0)
  *
  * 将 Git 底层对象库与 REST v3 / GraphQL v4 / MCP 资源视图实时联动，
- * 并对高频访问的 Issue 实体实施预序列化 Buffer 缓存。
+ * 并对高频访问的 Issue 实体预编译完整的 HTTP/1.1 Keep-Alive 响应帧。
  */
 
 import { GitRepositoryStore, encodeCommit, isHex40, type ChangedFileDiff } from './git-engine.ts';
@@ -22,6 +22,17 @@ export function fastNowIso(): { ms: number; iso: string } {
     cachedIsoStr = new Date(ms).toISOString();
   }
   return { ms, iso: cachedIsoStr };
+}
+
+/** 对纯 ASCII 安全字符串免去 JSON.stringify 开销 */
+function fastJsonString(s: string): string {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 32 || c === 34 || c === 92 || c >= 0xd800) {
+      return JSON.stringify(s);
+    }
+  }
+  return `"${s}"`;
 }
 
 /** 构造轻量级不透明全局 Relay Node ID（零 Buffer 分配） */
@@ -54,9 +65,11 @@ export interface IssueRecord {
   createdAtMs: number;
   created_at: string;
   updated_at: string;
-  /** 预序列化的精简合规 REST JSON Buffer（使 read 压测零 JSON.stringify） */
+  /** 预序列化的 REST JSON Buffer（直接作为 restHttp200Frame 的零拷贝 subarray） */
   restJsonBuf: Buffer;
-  /** 预编译的零拷贝 HTTP 响应头数组（消除 writeHead 时的对象分配与字符串化） */
+  /** 预编译的完整 HTTP/1.1 200 OK Keep-Alive 二进制响应帧 */
+  restHttp200Frame: Buffer;
+  /** 兼容保留字段 */
   restHeaders: string[];
 }
 
@@ -84,7 +97,9 @@ export interface RepoRecord {
   node_id: string;
   name: string;
   full_name: string;
+  fullNameBuf: Buffer;
   owner: string;
+  ownerJson: string;
   private: boolean;
   description: string;
   default_branch: string;
@@ -103,17 +118,17 @@ export interface RepoRecord {
   nextPullNumber: number;
 }
 
-export function buildIssueRestBuffer(issue: IssueRecord, owner: string): Buffer {
+function buildIssueJsonString(issue: IssueRecord, owner: string, ownerJson: string): string {
   if (issue.labels.length === 0) {
-    const fastJson =
+    return (
       `{"id":${issue.id},"node_id":"${issue.node_id}","number":${issue.number},` +
-      `"title":${JSON.stringify(issue.title)},"body":${JSON.stringify(issue.body)},` +
+      `"title":${fastJsonString(issue.title)},"body":${fastJsonString(issue.body)},` +
       `"state":"${issue.state}","labels":[],"comments":${issue.comments.length},` +
-      `"user":{"login":${JSON.stringify(owner)},"id":1000,"type":"User"},` +
-      `"created_at":"${issue.created_at}","updated_at":"${issue.updated_at}"}`;
-    return Buffer.from(fastJson, 'utf8');
+      `"user":{"login":${ownerJson},"id":1000,"type":"User"},` +
+      `"created_at":"${issue.created_at}","updated_at":"${issue.updated_at}"}`
+    );
   }
-  const payload = {
+  return JSON.stringify({
     id: issue.id,
     node_id: issue.node_id,
     number: issue.number,
@@ -125,20 +140,45 @@ export function buildIssueRestBuffer(issue: IssueRecord, owner: string): Buffer 
     user: { login: owner, id: 1000, type: 'User' },
     created_at: issue.created_at,
     updated_at: issue.updated_at,
-  };
-  return Buffer.from(JSON.stringify(payload), 'utf8');
+  });
 }
 
-export function refreshIssueRestCache(issue: IssueRecord, owner: string): void {
-  const buf = buildIssueRestBuffer(issue, owner);
-  issue.restJsonBuf = buf;
+export function buildIssueRestBuffer(issue: IssueRecord, owner: string): Buffer {
+  return Buffer.from(buildIssueJsonString(issue, owner, JSON.stringify(owner)), 'utf8');
+}
+
+export function buildIssue201Frame(issue: IssueRecord): Buffer {
+  const body = issue.restJsonBuf;
+  const hdr =
+    `HTTP/1.1 201 Created\r\nContent-Type: application/json; charset=utf-8\r\n` +
+    `Content-Length: ${body.length}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\n\r\n`;
+  const hdrLen = Buffer.byteLength(hdr, 'latin1');
+  const frame = Buffer.allocUnsafe(hdrLen + body.length);
+  frame.write(hdr, 0, hdrLen, 'latin1');
+  body.copy(frame, hdrLen);
+  return frame;
+}
+
+export function refreshIssueRestCache(issue: IssueRecord, owner: string, ownerJson?: string): void {
+  const jsonStr = buildIssueJsonString(issue, owner, ownerJson ?? JSON.stringify(owner));
+  const bodyLen = Buffer.byteLength(jsonStr, 'utf8');
+  const hdr =
+    `HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n` +
+    `Content-Length: ${bodyLen}\r\nX-GitHub-Request-Id: r1\r\nConnection: keep-alive\r\n\r\n`;
+  const hdrLen = Buffer.byteLength(hdr, 'latin1');
+  const frame200 = Buffer.allocUnsafe(hdrLen + bodyLen);
+  frame200.write(hdr, 0, hdrLen, 'latin1');
+  frame200.write(jsonStr, hdrLen, bodyLen, 'utf8');
+
+  issue.restHttp200Frame = frame200;
+  issue.restJsonBuf = frame200.subarray(hdrLen);
   issue.restHeaders = [
     'Content-Type',
     'application/json; charset=utf-8',
     'Content-Length',
-    String(buf.length),
+    String(bodyLen),
     'X-GitHub-Request-Id',
-    '1',
+    'r1',
   ];
 }
 
@@ -167,9 +207,10 @@ export function serializeRepoRest(repo: RepoRecord): Record<string, unknown> {
 }
 
 export function serializePullRest(repo: RepoRecord, pr: PullRequestRecord): Record<string, unknown> {
-  // 如果 PR 仍处于 open 状态，同步反映当前分支最新 tip（如存在）
-  const liveHead = pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.headRef}`) ?? pr.headSha) : pr.headSha;
-  const liveBase = pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha) : pr.baseSha;
+  const liveHead =
+    pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.headRef}`) ?? pr.headSha) : pr.headSha;
+  const liveBase =
+    pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha) : pr.baseSha;
   return {
     id: pr.id,
     node_id: pr.node_id,
@@ -197,11 +238,14 @@ export function serializePullRest(repo: RepoRecord, pr: PullRequestRecord): Reco
   };
 }
 
+const EMPTY_BUF = Buffer.alloc(0);
+
 /**
  * 全局 Forge 状态存储
  */
 export class ForgeStore {
   nextEntityId = 5000;
+  deleteCount = 0;
   viewerLogin: string = process.env.MAKEFUN_SHOP_OWNER || DEFAULT_VIEWER_LOGIN;
 
   /** key: `${owner}/${repoName}` */
@@ -218,6 +262,7 @@ export class ForgeStore {
     const key = `${owner}/${name}`;
     const existing = this.repos.get(key);
     if (!existing) return false;
+    this.deleteCount++;
     this.repos.delete(key);
     this.reposByNodeId.delete(existing.node_id);
     for (const issue of existing.issuesList) {
@@ -253,7 +298,9 @@ export class ForgeStore {
       node_id: nodeId,
       name: opts.name,
       full_name: key,
+      fullNameBuf: Buffer.from(key, 'utf8'),
       owner,
+      ownerJson: JSON.stringify(owner),
       private: opts.isPrivate ?? false,
       description: typeof opts.description === 'string' ? opts.description : '',
       default_branch: defaultBranch,
@@ -283,7 +330,12 @@ export class ForgeStore {
     const resolvedLabels: LabelItem[] = [];
     if (Array.isArray(opts.labelNames) && opts.labelNames.length > 0) {
       for (const raw of opts.labelNames) {
-        const lName = typeof raw === 'string' ? raw : typeof raw === 'object' && raw !== null ? String((raw as { name?: unknown }).name ?? '') : '';
+        const lName =
+          typeof raw === 'string'
+            ? raw
+            : typeof raw === 'object' && raw !== null
+              ? String((raw as { name?: unknown }).name ?? '')
+              : '';
         const found = repo.labels.get(lName);
         if (!found) {
           return { ok: false, status: 422, message: `Validation Failed: label '${lName}' does not exist` };
@@ -309,10 +361,11 @@ export class ForgeStore {
       createdAtMs: ms,
       created_at: iso,
       updated_at: iso,
-      restJsonBuf: Buffer.alloc(0),
+      restJsonBuf: EMPTY_BUF,
+      restHttp200Frame: EMPTY_BUF,
       restHeaders: [],
     };
-    refreshIssueRestCache(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner, repo.ownerJson);
 
     repo.issuesList.push(issue);
     repo.issuesByNumber[number] = issue;
@@ -332,7 +385,7 @@ export class ForgeStore {
       issue.state = patch.state;
     }
     issue.updated_at = fastNowIso().iso;
-    refreshIssueRestCache(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner, repo.ownerJson);
     return issue;
   }
 
@@ -350,7 +403,7 @@ export class ForgeStore {
     };
     issue.comments.push(comment);
     issue.updated_at = iso;
-    refreshIssueRestCache(issue, repo.owner);
+    refreshIssueRestCache(issue, repo.owner, repo.ownerJson);
     return comment;
   }
 
@@ -375,16 +428,20 @@ export class ForgeStore {
     repo: RepoRecord,
     rawPath: string,
     opts: { message: string; contentBase64: string; branch?: string; sha?: string },
-  ): { ok: true; status: number; fileSha: string; fileSize: number; commitSha: string } | { ok: false; status: number; message: string } {
+  ):
+    | { ok: true; status: number; fileSha: string; fileSize: number; commitSha: string }
+    | { ok: false; status: number; message: string } {
     const cleanPath = rawPath.replace(/^\/+|\/+$/g, '');
     if (!cleanPath) {
       return { ok: false, status: 422, message: 'Invalid file path' };
     }
-    const branch = opts.branch && opts.branch.trim() !== '' ? opts.branch.trim().replace(/^refs\/heads\//, '') : repo.default_branch;
+    const branch =
+      opts.branch && opts.branch.trim() !== ''
+        ? opts.branch.trim().replace(/^refs\/heads\//, '')
+        : repo.default_branch;
     const refName = `refs/heads/${branch}`;
     let parentSha = repo.git.refs.get(refName) ?? null;
     if (!parentSha && branch !== repo.default_branch) {
-      // 若指定的新分支不存在但默认分支已有提交，则基于默认分支派生
       parentSha = repo.git.refs.get(`refs/heads/${repo.default_branch}`) ?? null;
     }
 
@@ -430,7 +487,10 @@ export class ForgeStore {
     opts: { message: string; sha?: string; branch?: string },
   ): { ok: true; commitSha: string } | { ok: false; status: number; message: string } {
     const cleanPath = rawPath.replace(/^\/+|\/+$/g, '');
-    const branch = opts.branch && opts.branch.trim() !== '' ? opts.branch.trim().replace(/^refs\/heads\//, '') : repo.default_branch;
+    const branch =
+      opts.branch && opts.branch.trim() !== ''
+        ? opts.branch.trim().replace(/^refs\/heads\//, '')
+        : repo.default_branch;
     const refName = `refs/heads/${branch}`;
     const parentSha = repo.git.refs.get(refName);
     if (!parentSha) {
@@ -570,23 +630,22 @@ export class ForgeStore {
     repo: RepoRecord,
     opts: { title: string; body?: string | null; head: string; base: string },
   ): { ok: true; pull: PullRequestRecord } | { ok: false; status: number; message: string } {
-    const normalizeRef = (r: string): string => {
-      let clean = r.trim();
-      if (clean.startsWith(`${repo.owner}:`)) clean = clean.slice(repo.owner.length + 1);
-      if (clean.startsWith('refs/heads/')) clean = clean.slice('refs/heads/'.length);
-      return clean;
+    const normalizeRef = (raw: string): string => {
+      let s = raw.trim();
+      const colonIdx = s.indexOf(':');
+      if (colonIdx !== -1) s = s.slice(colonIdx + 1);
+      return s.replace(/^refs\/heads\//, '');
     };
-
     const headRef = normalizeRef(opts.head);
     const baseRef = normalizeRef(opts.base);
-    const headSha = repo.git.refs.get(`refs/heads/${headRef}`);
-    const baseSha = repo.git.refs.get(`refs/heads/${baseRef}`);
 
+    const headSha = repo.git.refs.get(`refs/heads/${headRef}`);
     if (!headSha) {
-      return { ok: false, status: 422, message: `Invalid head branch: ${headRef}` };
+      return { ok: false, status: 422, message: `Validation Failed: head branch '${headRef}' does not exist` };
     }
+    const baseSha = repo.git.refs.get(`refs/heads/${baseRef}`);
     if (!baseSha) {
-      return { ok: false, status: 422, message: `Invalid base branch: ${baseRef}` };
+      return { ok: false, status: 422, message: `Validation Failed: base branch '${baseRef}' does not exist` };
     }
 
     const id = ++this.nextEntityId;
@@ -594,7 +653,7 @@ export class ForgeStore {
     const number = repo.nextPullNumber++;
     const { ms, iso } = fastNowIso();
 
-    const pull: PullRequestRecord = {
+    const pr: PullRequestRecord = {
       id,
       node_id: nodeId,
       number,
@@ -613,52 +672,119 @@ export class ForgeStore {
       updated_at: iso,
     };
 
-    repo.pullsList.push(pull);
-    repo.pullsByNumber.set(number, pull);
-    this.pullsByNodeId.set(nodeId, { repo, pull });
-    return { ok: true, pull };
+    repo.pullsList.push(pr);
+    repo.pullsByNumber.set(number, pr);
+    this.pullsByNodeId.set(nodeId, { repo, pull: pr });
+    return { ok: true, pull: pr };
   }
 
-  /** 计算 PR 变更文件列表 */
-  getPullFiles(repo: RepoRecord, pull: PullRequestRecord): ChangedFileDiff[] {
-    const headSha = pull.state === 'open' ? (repo.git.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha) : pull.headSha;
-    const baseSha = pull.baseSha;
-    return repo.git.diffCommits(baseSha, headSha);
+  /** 计算 PR 当前的真实文件变更列表 */
+  getPullFiles(repo: RepoRecord, pr: PullRequestRecord): ChangedFileDiff[] {
+    if (pr.merged && pr.merge_commit_sha) {
+      const mergeCommit = repo.git.getCommit(pr.merge_commit_sha);
+      if (mergeCommit && mergeCommit.parents.length >= 2) {
+        return repo.git.diffCommits(mergeCommit.parents[0]!, pr.merge_commit_sha);
+      }
+    }
+    const liveHead =
+      pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.headRef}`) ?? pr.headSha) : pr.headSha;
+    const liveBase =
+      pr.state === 'open' ? (repo.git.refs.get(`refs/heads/${pr.baseRef}`) ?? pr.baseSha) : pr.baseSha;
+    return repo.git.diffCommits(liveBase, liveHead);
   }
 
-  /** 合并 Pull Request（更新真实 Git 分支与 Commit 历史，冲突返回 405） */
+  /** 合并 Pull Request（支持 merge / squash / rebase 三种策略，真实提交进 Git 仓库） */
   mergePullRequest(
     repo: RepoRecord,
-    pull: PullRequestRecord,
-    mergeMethod: 'merge' | 'squash' | 'rebase' = 'merge',
-    commitTitle?: string,
-  ): { ok: true; sha: string; pull: PullRequestRecord } | { ok: false; status: number; message: string } {
-    if (pull.merged || pull.state !== 'open') {
-      return { ok: false, status: 405, message: 'Pull Request is already closed or merged' };
+    pr: PullRequestRecord,
+    optsOrMethod?: { mergeMethod?: string; commitTitle?: string; commitMessage?: string } | string,
+    commitTitleArg?: string,
+  ):
+    | { ok: true; sha: string; message: string; pull: PullRequestRecord }
+    | { ok: false; status: number; message: string } {
+    const opts: { mergeMethod?: string; commitTitle?: string; commitMessage?: string } =
+      typeof optsOrMethod === 'string'
+        ? { mergeMethod: optsOrMethod, commitTitle: commitTitleArg }
+        : optsOrMethod ?? {};
+    if (pr.merged) {
+      return { ok: false, status: 405, message: 'Pull Request is already merged' };
+    }
+    if (pr.state !== 'open') {
+      return { ok: false, status: 405, message: 'Pull Request is closed' };
     }
 
-    const currentHead = repo.git.refs.get(`refs/heads/${pull.headRef}`) ?? pull.headSha;
-    const currentBase = repo.git.refs.get(`refs/heads/${pull.baseRef}`) ?? pull.baseSha;
-    pull.headSha = currentHead;
-    pull.baseSha = currentBase;
+    const headRefKey = `refs/heads/${pr.headRef}`;
+    const baseRefKey = `refs/heads/${pr.baseRef}`;
+    const currentHeadSha = repo.git.refs.get(headRefKey) ?? pr.headSha;
+    const currentBaseSha = repo.git.refs.get(baseRefKey) ?? pr.baseSha;
 
-    const merged = repo.git.mergeBranches(
-      pull.baseRef,
-      pull.headRef,
-      mergeMethod,
-      commitTitle || `${pull.title} (#${pull.number})`,
-    );
-    if (!merged.ok) {
-      return { ok: false, status: 405, message: merged.reason };
+    const method = (opts.mergeMethod || 'merge').toLowerCase();
+    const mergedTreeOid = repo.git.threeWayMergeTrees(currentBaseSha, currentHeadSha);
+    if (mergedTreeOid === null) {
+      return { ok: false, status: 405, message: 'Merge conflict: cannot cleanly merge head into base' };
     }
+
+    let finalSha: string;
+    const defaultMsg =
+      opts.commitTitle ||
+      opts.commitMessage ||
+      `Merge pull request #${pr.number} from ${repo.owner}/${pr.headRef}`;
+
+    if (method === 'squash') {
+      const msg = opts.commitTitle || opts.commitMessage || `${pr.title} (#${pr.number})`;
+      const cBuf = encodeCommit({
+        tree: mergedTreeOid,
+        parents: [currentBaseSha],
+        message: msg,
+      });
+      finalSha = repo.git.putObject('commit', cBuf).oid;
+      repo.exactCommitMessages.set(finalSha, msg);
+    } else if (method === 'rebase') {
+      const lca = repo.git.findMergeBase(currentBaseSha, currentHeadSha);
+      const commitsToReplay = repo.git.collectExclusiveHistory(currentHeadSha, lca);
+      if (commitsToReplay.length === 0) {
+        finalSha = currentBaseSha;
+      } else {
+        let curBase = currentBaseSha;
+        for (const origOid of commitsToReplay) {
+          const orig = repo.git.getCommit(origOid)!;
+          const rebasedTree = repo.git.threeWayMergeTrees(curBase, origOid);
+          if (rebasedTree === null) {
+            return { ok: false, status: 409, message: 'Merge conflict during rebase' };
+          }
+          const origMsg = repo.exactCommitMessages.get(origOid) ?? orig.message.replace(/\n$/, '');
+          const cBuf = encodeCommit({
+            tree: rebasedTree,
+            parents: [curBase],
+            message: origMsg,
+          });
+          curBase = repo.git.putObject('commit', cBuf).oid;
+          repo.exactCommitMessages.set(curBase, origMsg);
+        }
+        finalSha = curBase;
+      }
+    } else {
+      const cBuf = encodeCommit({
+        tree: mergedTreeOid,
+        parents: [currentBaseSha, currentHeadSha],
+        message: defaultMsg,
+      });
+      finalSha = repo.git.putObject('commit', cBuf).oid;
+      repo.exactCommitMessages.set(finalSha, defaultMsg);
+    }
+
+    repo.git.refs.set(baseRefKey, finalSha);
+    repo.git.bumpVersion();
 
     const { iso } = fastNowIso();
-    pull.merged = true;
-    pull.state = 'closed';
-    pull.merged_at = iso;
-    pull.merge_commit_sha = merged.commitSha;
-    pull.updated_at = iso;
+    pr.headSha = currentHeadSha;
+    pr.baseSha = currentBaseSha;
+    pr.merged = true;
+    pr.state = 'closed';
+    pr.merged_at = iso;
+    pr.merge_commit_sha = finalSha;
+    pr.updated_at = iso;
 
-    return { ok: true, sha: merged.commitSha, pull };
+    return { ok: true, sha: finalSha, message: 'Pull Request successfully merged', pull: pr };
   }
 }

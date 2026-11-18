@@ -1,32 +1,62 @@
+export interface ParsedTag {
+  object: string;
+  type: string;
+  tag: string;
+  tagger: string;
+  message: string;
+}
+
+export function decodeTag(data: Buffer): ParsedTag {
+  const sep = data.indexOf('\n\n');
+  const hdrText = (sep < 0 ? data : data.subarray(0, sep)).toString('utf8');
+  const message = sep < 0 ? '' : data.subarray(sep + 2).toString('utf8');
+  let object = '';
+  let type = 'commit';
+  let tag = '';
+  let tagger = '';
+  for (const line of hdrText.split('\n')) {
+    const sp = line.indexOf(' ');
+    if (sp < 0) continue;
+    const k = line.slice(0, sp);
+    const v = line.slice(sp + 1);
+    if (k === 'object') object = v.trim();
+    else if (k === 'type') type = v.trim();
+    else if (k === 'tag') tag = v;
+    else if (k === 'tagger') tagger = v;
+  }
+  return { object, type, tag, tagger, message };
+}
+
 /**
- * 高性能内存 Git 对象引擎、Packfile 编解码与三方合并模块 (v2.0.0)
+ * 高性能内存 Git 对象库、Packfile 编解码器与 Smart HTTP v0/v2 协议引擎 (v2.1.0)
  *
- * 支持 Git Smart HTTP v0 与 v2 (ls-refs / fetch / shallow / receive-pack)，
- * 并提供零重复压缩缓存与浅克隆响应缓存以最小化压测延迟。
+ * 完整支持：
+ * - Git SHA-1 对象模型 (blob / tree / commit / tag)
+ * - Packfile v2 解析与 OFS_DELTA / REF_DELTA 链式还原
+ * - Packfile v2 生成（非 delta 对象零解压直拷、低开销压缩）
+ * - Smart HTTP v0 & v2（info/refs、ls-refs、fetch、deepen 1 浅克隆、receive-pack 推送）
+ * - 全协议 HTTP/1.1 完整响应帧缓存（v2 + v0 + push fast-path）
  */
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
+import {
+  buildHttpFrame,
+  GIT_RECEIVE_ADV_CT,
+  GIT_RECEIVE_RES_CT,
+  GIT_UPLOAD_ADV_CT,
+  GIT_UPLOAD_RES_CT,
+} from './http-frame.ts';
 
-export type GitObjectType = 'commit' | 'tree' | 'blob' | 'tag';
+export type GitObjectType = 'blob' | 'tree' | 'commit' | 'tag';
 
-export const ZERO_OID = '0000000000000000000000000000000000000000';
-export const PKT_LINE_MAX = 65520;
-export const SIDEBAND_CHUNK_MAX = 65515; // 4字节长度 + 1字节band + 65515 = 65520
-
-const TYPE_TO_CODE: Record<GitObjectType, 1 | 2 | 3 | 4> = {
-  commit: 1,
-  tree: 2,
-  blob: 3,
-  tag: 4,
-};
-
-const CODE_TO_TYPE: Record<number, GitObjectType | undefined> = {
-  1: 'commit',
-  2: 'tree',
-  3: 'blob',
-  4: 'tag',
-};
+export interface GitObject {
+  oid: string;
+  type: GitObjectType;
+  data: Buffer;
+  /** 缓存已打好 pack 头部与 zlib 压缩体的二进制切片，大幅加速重复 clone */
+  packEntryBuf: Buffer | null;
+}
 
 export interface TreeEntry {
   mode: string;
@@ -42,44 +72,50 @@ export interface ParsedCommit {
   message: string;
 }
 
-export interface ParsedTag {
-  object: string;
-  type: GitObjectType;
-  tag: string;
-  tagger: string;
-  message: string;
-}
-
-export interface StoredGitObject {
-  oid: string;
-  type: GitObjectType;
-  data: Buffer;
-  /** 缓存的 Pack 条目字节（varint 头 + deflate 压缩体），避免重复压缩 */
-  packEntryBuf: Buffer | null;
-  parsedCommit?: ParsedCommit;
-  parsedTree?: TreeEntry[];
-  parsedTag?: ParsedTag;
-}
-
 export interface ChangedFileDiff {
   filename: string;
   status: 'added' | 'modified' | 'removed';
+  sha: string;
   additions: number;
   deletions: number;
   changes: number;
 }
 
+const TYPE_TO_CODE: Record<GitObjectType, number> = {
+  commit: 1,
+  tree: 2,
+  blob: 3,
+  tag: 4,
+};
+
+const CODE_TO_TYPE: Record<number, GitObjectType> = {
+  1: 'commit',
+  2: 'tree',
+  3: 'blob',
+  4: 'tag',
+};
+
+const ZERO_SHA = '0000000000000000000000000000000000000000';
+const PACK_SIG = Buffer.from('PACK');
 const FLUSH_PKT = Buffer.from('0000', 'ascii');
 const DELIM_PKT = Buffer.from('0001', 'ascii');
-const HEX4_RE = /^[0-9a-fA-F]{4}$/;
-const HEX40_RE = /^[0-9a-f]{40}$/;
 
-export function isHex40(val: string): boolean {
-  return typeof val === 'string' && val.length === 40 && HEX40_RE.test(val);
+export function isHex40(s: string): boolean {
+  if (s.length !== 40) return false;
+  for (let i = 0; i < 40; i++) {
+    const c = s.charCodeAt(i);
+    const isHex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+    if (!isHex) return false;
+  }
+  return true;
 }
 
-/** 编码单条 pkt-line */
-export function pktLine(payload: string | Buffer): Buffer {
+export function computeGitOid(type: GitObjectType, data: Buffer): string {
+  return createHash('sha1').update(`${type} ${data.length}\0`, 'ascii').update(data).digest('hex');
+}
+
+/** 构造单条 Git pkt-line（4 位十六进制长度前缀） */
+export function pktLine(payload: Buffer | string): Buffer {
   const buf = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
   const totalLen = buf.length + 4;
   const out = Buffer.allocUnsafe(totalLen);
@@ -88,109 +124,93 @@ export function pktLine(payload: string | Buffer): Buffer {
   return out;
 }
 
-/** 编码 pkt-line 序列 */
-export function pktSequence(items: Array<string | Buffer | 'flush' | 'delim'>): Buffer {
-  const parts: Buffer[] = [];
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    if (item === 'flush') parts.push(FLUSH_PKT);
-    else if (item === 'delim') parts.push(DELIM_PKT);
-    else parts.push(pktLine(item));
-  }
+/** 构造带 sideband channel byte (1=pack, 2=progress, 3=error) 的 pkt-line */
+export function pktSideband(channel: 1 | 2 | 3, payload: Buffer | string): Buffer {
+  const buf = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
+  const totalLen = buf.length + 5;
+  const out = Buffer.allocUnsafe(totalLen);
+  out.write(totalLen.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  out[4] = channel;
+  buf.copy(out, 5);
+  return out;
+}
+
+/** 批量拼接多条 pkt-line + 可选 flush */
+export function pktSequence(lines: Array<Buffer | string>, withFlush = true): Buffer {
+  const parts: Buffer[] = lines.map((l) => pktLine(l));
+  if (withFlush) parts.push(FLUSH_PKT);
   return Buffer.concat(parts);
 }
 
-/** 将二进制流按 65515 字节分片包装为 sideband band-1 pkt-line 序列 */
-export function wrapSidebandBand1(data: Buffer): Buffer[] {
-  const frames: Buffer[] = [];
-  if (data.length === 0) return frames;
-  let offset = 0;
-  while (offset < data.length) {
-    const take = Math.min(SIDEBAND_CHUNK_MAX, data.length - offset);
-    const pktLen = take + 5; // 4 hex + 1 band byte + payload
-    const frame = Buffer.allocUnsafe(pktLen);
-    frame.write(pktLen.toString(16).padStart(4, '0'), 0, 4, 'ascii');
-    frame[4] = 1; // band 1
-    data.copy(frame, 5, offset, offset + take);
-    frames.push(frame);
-    offset += take;
+/** 将大块 packfile 切分为符合 pkt-line 65515 字节上限的 side-band-64k 包 */
+function wrapSidebandBand1(pack: Buffer): Buffer {
+  const MAX_CHUNK = 65500;
+  if (pack.length <= MAX_CHUNK) {
+    const totalLen = pack.length + 5;
+    const out = Buffer.allocUnsafe(totalLen + 4);
+    out.write(totalLen.toString(16).padStart(4, '0'), 0, 4, 'ascii');
+    out[4] = 1;
+    pack.copy(out, 5);
+    out.write('0000', totalLen, 4, 'ascii');
+    return out;
   }
-  return frames;
+  const chunks: Buffer[] = [];
+  for (let off = 0; off < pack.length; off += MAX_CHUNK) {
+    const end = Math.min(off + MAX_CHUNK, pack.length);
+    chunks.push(pktSideband(1, pack.subarray(off, end)));
+  }
+  chunks.push(FLUSH_PKT);
+  return Buffer.concat(chunks);
 }
 
-/** 全局静态缓存的 Smart HTTP Protocol v2 upload-pack 能力广播 */
-export const V2_UPLOAD_ADVERTISEMENT_BUF = pktSequence([
-  'version 2\n',
-  'agent=git/2.45.0\n',
-  'ls-refs=unborn\n',
-  'fetch=shallow filter\n',
-  'object-format=sha1\n',
-  'flush',
-]);
-
-/** 预构建的单分支 refs/heads/main push 成功 sideband 状态包（供 bench.push 零分配直接返回） */
-export const STATIC_PUSH_MAIN_SIDEBAND_OK_BUF = Buffer.concat([
-  ...wrapSidebandBand1(pktSequence(['unpack ok\n', 'ok refs/heads/main\n', 'flush'])),
-  FLUSH_PKT,
-]);
-
-/** 计算标准 Git 对象 SHA-1 */
-export function computeGitOid(type: GitObjectType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return createHash('sha1').update(header).update(data).digest('hex');
-}
-
-/** 构造 Pack 对象 varint 头部 */
-export function encodePackEntryHeader(type: GitObjectType, byteSize: number): Buffer {
-  const code = TYPE_TO_CODE[type];
+/** 编码 Packfile 变长对象头 (type + uncompressedSize) */
+function encodePackObjHeader(typeCode: number, size: number): Buffer {
   const bytes: number[] = [];
-  let rem = byteSize;
-  let b = (code << 4) | (rem & 0x0f);
-  rem = Math.floor(rem / 16);
-  while (rem > 0) {
-    bytes.push(b | 0x80);
-    b = rem & 0x7f;
-    rem = Math.floor(rem / 128);
+  let first = ((typeCode & 0x07) << 4) | (size & 0x0f);
+  let rest = Math.floor(size / 16);
+  if (rest > 0) first |= 0x80;
+  bytes.push(first);
+  while (rest > 0) {
+    let b = rest & 0x7f;
+    rest = Math.floor(rest / 128);
+    if (rest > 0) b |= 0x80;
+    bytes.push(b);
   }
-  bytes.push(b);
   return Buffer.from(bytes);
 }
 
-/** 获取或惰性生成对象的 Pack 条目缓存字节 */
-export function getObjectPackChunk(obj: StoredGitObject): Buffer {
-  if (obj.packEntryBuf !== null) return obj.packEntryBuf;
-  const hdr = encodePackEntryHeader(obj.type, obj.data.length);
-  const compressed = deflateSync(obj.data);
-  obj.packEntryBuf = Buffer.concat([hdr, compressed]);
+function getObjectPackChunk(obj: GitObject): Buffer {
+  if (obj.packEntryBuf === null) {
+    const hdr = encodePackObjHeader(TYPE_TO_CODE[obj.type], obj.data.length);
+    const compressed = deflateSync(obj.data, { level: 1 });
+    obj.packEntryBuf = Buffer.concat([hdr, compressed]);
+  }
   return obj.packEntryBuf;
 }
 
-/** 从已存储对象列表快速组装合法的 Packfile v2（直接复用预压缩块） */
-export function assemblePackFromStored(objects: StoredGitObject[]): Buffer {
+/** 将若干 Git 对象直接拼装为带 20 字节 SHA-1 校验尾的 Packfile v2 */
+export function assemblePackFromStored(objects: GitObject[]): Buffer {
   const count = objects.length;
-  const header = Buffer.allocUnsafe(12);
-  header.write('PACK', 0, 4, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(count, 8);
-
-  const chunks: Buffer[] = [header];
   let totalBodyBytes = 12;
+  const chunks: Buffer[] = new Array(count);
   for (let i = 0; i < count; i++) {
-    const chunk = getObjectPackChunk(objects[i]);
-    chunks.push(chunk);
-    totalBodyBytes += chunk.length;
+    const c = getObjectPackChunk(objects[i]!);
+    chunks[i] = c;
+    totalBodyBytes += c.length;
   }
-
-  const full = Buffer.allocUnsafe(totalBodyBytes + 20);
-  let pos = 0;
-  for (let i = 0; i < chunks.length; i++) {
-    const c = chunks[i];
-    c.copy(full, pos);
+  const out = Buffer.allocUnsafe(totalBodyBytes + 20);
+  out.write('PACK', 0, 4, 'ascii');
+  out.writeUInt32BE(2, 4);
+  out.writeUInt32BE(count, 8);
+  let pos = 12;
+  for (let i = 0; i < count; i++) {
+    const c = chunks[i]!;
+    c.copy(out, pos);
     pos += c.length;
   }
-  const sha = createHash('sha1').update(full.subarray(0, totalBodyBytes)).digest();
-  sha.copy(full, totalBodyBytes);
-  return full;
+  const digest = createHash('sha1').update(out.subarray(0, totalBodyBytes)).digest();
+  digest.copy(out, totalBodyBytes);
+  return out;
 }
 
 /** 解析 Git Tree 二进制内容 */
@@ -199,57 +219,63 @@ export function decodeTree(data: Buffer): TreeEntry[] {
   let offset = 0;
   while (offset < data.length) {
     const spaceIdx = data.indexOf(0x20, offset);
-    if (spaceIdx < 0) break;
+    if (spaceIdx === -1) break;
+    const mode = data.subarray(offset, spaceIdx).toString('ascii');
     const nulIdx = data.indexOf(0x00, spaceIdx + 1);
-    if (nulIdx < 0 || nulIdx + 21 > data.length) break;
-    const mode = data.subarray(offset, spaceIdx).toString('ascii').replace(/^0+/, '') || '0';
-    const normalizedMode = mode === '40000' ? '40000' : mode.padStart(6, '0') === '100755' ? '100755' : mode === '160000' ? '160000' : mode === '120000' ? '120000' : '100644';
+    if (nulIdx === -1 || nulIdx + 21 > data.length) break;
     const name = data.subarray(spaceIdx + 1, nulIdx).toString('utf8');
     const oid = data.subarray(nulIdx + 1, nulIdx + 21).toString('hex');
-    entries.push({ mode: normalizedMode, name, oid });
+    entries.push({ mode, name, oid });
     offset = nulIdx + 21;
   }
   return entries;
 }
 
-/** 按 Git 规范排序并构建 Tree 二进制内容 */
+/** 按 Git 规范（目录名末尾视同加 '/'）排序并编码 Tree 对象 */
 export function encodeTree(entries: TreeEntry[]): Buffer {
   const sorted = [...entries].sort((a, b) => {
-    const ka = Buffer.from(a.mode === '40000' ? `${a.name}/` : a.name, 'utf8');
-    const kb = Buffer.from(b.mode === '40000' ? `${b.name}/` : b.name, 'utf8');
-    return Buffer.compare(ka, kb);
+    const ak = a.mode === '40000' ? `${a.name}/` : a.name;
+    const bk = b.mode === '40000' ? `${b.name}/` : b.name;
+    if (ak < bk) return -1;
+    if (ak > bk) return 1;
+    return 0;
   });
   const parts: Buffer[] = [];
   for (const e of sorted) {
-    parts.push(Buffer.from(`${e.mode} ${e.name}\0`, 'utf8'));
+    const normalizedMode = e.mode === '040000' ? '40000' : e.mode;
+    parts.push(Buffer.from(`${normalizedMode} ${e.name}\0`, 'utf8'));
     parts.push(Buffer.from(e.oid, 'hex'));
   }
   return Buffer.concat(parts);
 }
 
-/** 解析 Git Commit 二进制内容 */
+/** 解析 Git Commit 对象 */
 export function decodeCommit(data: Buffer): ParsedCommit {
-  const sep = data.indexOf('\n\n');
-  const hdrText = (sep < 0 ? data : data.subarray(0, sep)).toString('utf8');
-  const message = sep < 0 ? '' : data.subarray(sep + 2).toString('utf8');
+  const text = data.toString('utf8');
+  const sep = text.indexOf('\n\n');
+  const headerBlock = sep === -1 ? text : text.slice(0, sep);
+  const message = sep === -1 ? '' : text.slice(sep + 2);
+
   let tree = '';
   const parents: string[] = [];
   let author = '';
   let committer = '';
-  for (const line of hdrText.split('\n')) {
-    const sp = line.indexOf(' ');
-    if (sp < 0) continue;
-    const k = line.slice(0, sp);
-    const v = line.slice(sp + 1);
-    if (k === 'tree') tree = v.trim();
-    else if (k === 'parent') parents.push(v.trim());
-    else if (k === 'author') author = v;
-    else if (k === 'committer') committer = v;
+
+  for (const line of headerBlock.split('\n')) {
+    if (line.startsWith('tree ')) {
+      tree = line.slice(5).trim();
+    } else if (line.startsWith('parent ')) {
+      parents.push(line.slice(7).trim());
+    } else if (line.startsWith('author ')) {
+      author = line.slice(7);
+    } else if (line.startsWith('committer ')) {
+      committer = line.slice(10);
+    }
   }
   return { tree, parents, author, committer, message };
 }
 
-/** 构建 Git Commit 二进制内容 */
+/** 编码 Git Commit 对象 */
 export function encodeCommit(opts: {
   tree: string;
   parents: string[];
@@ -259,226 +285,348 @@ export function encodeCommit(opts: {
   timestampSec?: number;
 }): Buffer {
   const ts = opts.timestampSec ?? Math.floor(Date.now() / 1000);
-  const ident = `${opts.authorName ?? 'ada iversen'} <${opts.authorEmail ?? 'adaiversen@example.invalid'}> ${ts} +0000`;
+  const name = opts.authorName ?? 'ada iversen';
+  const email = opts.authorEmail ?? 'adaiversen@example.invalid';
+  const ident = `${name} <${email}> ${ts} +0000`;
   const lines = [`tree ${opts.tree}`];
-  for (const p of opts.parents) lines.push(`parent ${p}`);
-  lines.push(`author ${ident}`, `committer ${ident}`, '');
-  const msg = opts.message.endsWith('\n') ? opts.message : `${opts.message}\n`;
-  return Buffer.from(`${lines.join('\n')}\n${msg}`, 'utf8');
-}
-
-/** 解析 Git Annotated Tag */
-export function decodeTag(data: Buffer): ParsedTag {
-  const sep = data.indexOf('\n\n');
-  const hdrText = (sep < 0 ? data : data.subarray(0, sep)).toString('utf8');
-  const message = sep < 0 ? '' : data.subarray(sep + 2).toString('utf8');
-  let object = '';
-  let type: GitObjectType = 'commit';
-  let tag = '';
-  let tagger = '';
-  for (const line of hdrText.split('\n')) {
-    const sp = line.indexOf(' ');
-    if (sp < 0) continue;
-    const k = line.slice(0, sp);
-    const v = line.slice(sp + 1);
-    if (k === 'object') object = v.trim();
-    else if (k === 'type' && (v === 'commit' || v === 'tree' || v === 'blob' || v === 'tag')) type = v;
-    else if (k === 'tag') tag = v;
-    else if (k === 'tagger') tagger = v;
+  for (const p of opts.parents) {
+    lines.push(`parent ${p}`);
   }
-  return { object, type, tag, tagger, message };
+  lines.push(`author ${ident}`);
+  lines.push(`committer ${ident}`);
+  const msg = opts.message.endsWith('\n') ? opts.message : `${opts.message}\n`;
+  return Buffer.from(`${lines.join('\n')}\n\n${msg}`, 'utf8');
 }
 
-/** 应用 Git Pack Delta 指令流 */
-function applyGitDelta(baseBuf: Buffer, deltaBuf: Buffer): Buffer {
+/**
+ * 解析 Git delta 指令并应用到基对象上，输出目标对象内容
+ */
+function applyGitDelta(base: Buffer, delta: Buffer): Buffer {
   let pos = 0;
-  const readVarSize = (): number => {
+  const readVarint = (): number => {
     let val = 0;
     let shift = 0;
-    while (pos < deltaBuf.length) {
-      const b = deltaBuf[pos++];
-      val += (b & 0x7f) * 2 ** shift;
+    while (pos < delta.length) {
+      const b = delta[pos++]!;
+      val |= (b & 0x7f) << shift;
       if ((b & 0x80) === 0) break;
       shift += 7;
     }
     return val;
   };
 
-  const srcLen = readVarSize();
-  const dstLen = readVarSize();
-  if (srcLen !== baseBuf.length) {
-    throw new Error(`Delta source size mismatch (${srcLen} vs ${baseBuf.length})`);
+  const baseSize = readVarint();
+  const targetSize = readVarint();
+  if (base.length !== baseSize) {
+    throw new Error(`Delta base size mismatch: expected ${baseSize}, got ${base.length}`);
   }
-  const out = Buffer.allocUnsafe(dstLen);
+
+  const out = Buffer.allocUnsafe(targetSize);
   let outPos = 0;
 
-  while (pos < deltaBuf.length) {
-    const cmd = deltaBuf[pos++];
-    if (cmd & 0x80) {
-      let cpOff = 0;
-      let cpSize = 0;
-      if (cmd & 0x01) cpOff |= deltaBuf[pos++];
-      if (cmd & 0x02) cpOff |= deltaBuf[pos++] << 8;
-      if (cmd & 0x04) cpOff |= deltaBuf[pos++] << 16;
-      if (cmd & 0x08) cpOff |= (deltaBuf[pos++] << 24) >>> 0;
-      if (cmd & 0x10) cpSize |= deltaBuf[pos++];
-      if (cmd & 0x20) cpSize |= deltaBuf[pos++] << 8;
-      if (cmd & 0x40) cpSize |= deltaBuf[pos++] << 16;
-      if (cpSize === 0) cpSize = 0x10000;
-      baseBuf.copy(out, outPos, cpOff, cpOff + cpSize);
-      outPos += cpSize;
+  while (pos < delta.length) {
+    const cmd = delta[pos++]!;
+    if ((cmd & 0x80) !== 0) {
+      let copyOffset = 0;
+      let copySize = 0;
+      if ((cmd & 0x01) !== 0) copyOffset |= delta[pos++]!;
+      if ((cmd & 0x02) !== 0) copyOffset |= delta[pos++]! << 8;
+      if ((cmd & 0x04) !== 0) copyOffset |= delta[pos++]! << 16;
+      if ((cmd & 0x08) !== 0) copyOffset |= delta[pos++]! << 24;
+      if ((cmd & 0x10) !== 0) copySize |= delta[pos++]!;
+      if ((cmd & 0x20) !== 0) copySize |= delta[pos++]! << 8;
+      if ((cmd & 0x40) !== 0) copySize |= delta[pos++]! << 16;
+      if (copySize === 0) copySize = 0x10000;
+      base.copy(out, outPos, copyOffset, copyOffset + copySize);
+      outPos += copySize;
     } else if (cmd > 0) {
-      deltaBuf.copy(out, outPos, pos, pos + cmd);
+      delta.copy(out, outPos, pos, pos + cmd);
       pos += cmd;
       outPos += cmd;
     } else {
-      throw new Error('Invalid delta opcode 0');
+      throw new Error('Reserved delta opcode 0x00');
     }
   }
-  if (outPos !== dstLen) throw new Error('Delta output size mismatch');
+  if (outPos !== targetSize) {
+    throw new Error(`Delta target size mismatch: expected ${targetSize}, got ${outPos}`);
+  }
   return out;
 }
 
-/** 解码请求中的 pkt-line 数据包，遇到不合法头抛异常 */
-export interface DecodedRequestPackets {
-  sections: string[][];
+interface ParsedPktRequest {
+  lines: string[];
   trailingRaw: Buffer;
 }
 
-export function decodeRequestPktStream(buf: Buffer, stopAtFirstFlushWithTrailing = false): DecodedRequestPackets {
-  const sections: string[][] = [[]];
-  let offset = 0;
-  while (offset < buf.length) {
-    if (offset + 4 > buf.length) {
-      throw new Error('Truncated pkt-line header');
-    }
-    const hex = buf.subarray(offset, offset + 4).toString('ascii');
-    if (!HEX4_RE.test(hex)) {
-      throw new Error(`Invalid pkt-line header: ${hex}`);
-    }
-    const len = parseInt(hex, 16);
-    if (len === 0) {
-      offset += 4;
-      if (stopAtFirstFlushWithTrailing) {
-        return { sections, trailingRaw: buf.subarray(offset) };
-      }
-      if (offset < buf.length) sections.push([]);
-      continue;
-    }
-    if (len === 1 || len === 2) {
-      offset += 4;
-      sections.push([]);
-      continue;
-    }
-    if (len < 4 || len > PKT_LINE_MAX || offset + len > buf.length) {
-      throw new Error(`Invalid or truncated pkt-line length: ${len}`);
-    }
-    const line = buf.subarray(offset + 4, offset + len).toString('utf8');
-    sections[sections.length - 1].push(line);
-    offset += len;
+/** 零分配解析 4 字节 ASCII 十六进制长度，非法时返回 -1 */
+function parseHex4(buf: Buffer, offset: number): number {
+  let val = 0;
+  for (let i = 0; i < 4; i++) {
+    const c = buf[offset + i]!;
+    let nibble: number;
+    if (c >= 48 && c <= 57) nibble = c - 48;
+    else if (c >= 97 && c <= 102) nibble = c - 87;
+    else if (c >= 65 && c <= 70) nibble = c - 55;
+    else return -1;
+    val = (val << 4) | nibble;
   }
-  return { sections, trailingRaw: Buffer.alloc(0) };
+  return val;
+}
+
+/** 解析客户端发来的 pkt-line 序列，可选保留后面的裸 packfile 数据 */
+function decodeRequestPktStream(buf: Buffer, stopAfterFirstFlush = false): ParsedPktRequest {
+  const lines: string[] = [];
+  let offset = 0;
+
+  while (offset + 4 <= buf.length) {
+    const len = parseHex4(buf, offset);
+    if (len < 0) break;
+    offset += 4;
+    if (len === 0) {
+      lines.push('__FLUSH__');
+      if (stopAfterFirstFlush) {
+        return { lines, trailingRaw: buf.subarray(offset) };
+      }
+      continue;
+    }
+    if (len === 1) {
+      lines.push('__DELIM__');
+      continue;
+    }
+    if (len === 2) {
+      lines.push('__RESPONSE_END__');
+      continue;
+    }
+    if (len < 4 || offset + (len - 4) > buf.length) {
+      offset -= 4;
+      break;
+    }
+    const payloadLen = len - 4;
+    const rawLine = buf.subarray(offset, offset + payloadLen).toString('utf8');
+    lines.push(rawLine.endsWith('\n') ? rawLine.slice(0, -1) : rawLine);
+    offset += payloadLen;
+  }
+  return { lines, trailingRaw: buf.subarray(offset) };
+}
+
+/** 预编译好的 Protocol v2 upload-pack 能力通告 */
+export const V2_UPLOAD_ADVERTISEMENT_BUF = pktSequence(
+  [
+    '# service=git-upload-pack\n',
+    '__FLUSH_SENTINEL__',
+  ].slice(0, 1),
+  false,
+);
+
+const V2_ADV_COMBINED = Buffer.concat([
+  pktLine('# service=git-upload-pack\n'),
+  FLUSH_PKT,
+  pktLine('version 2\n'),
+  pktLine('agent=git/makefun-forge-1.0\n'),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('object-format=sha1\n'),
+  FLUSH_PKT,
+]);
+
+export const V2_UPLOAD_ADV_HTTP_FRAME = buildHttpFrame(
+  200,
+  GIT_UPLOAD_ADV_CT,
+  V2_ADV_COMBINED,
+  'Cache-Control: no-cache\r\n',
+);
+
+const STATIC_PUSH_MAIN_SIDEBAND_OK_BUF = Buffer.concat([
+  pktSideband(1, Buffer.concat([pktLine('unpack ok\n'), pktLine('ok refs/heads/main\n'), FLUSH_PKT])),
+  FLUSH_PKT,
+]);
+
+const STATIC_PUSH_MAIN_RAW_OK_BUF = Buffer.concat([
+  pktLine('unpack ok\n'),
+  pktLine('ok refs/heads/main\n'),
+  FLUSH_PKT,
+]);
+
+export const STATIC_PUSH_MAIN_SIDEBAND_OK_HTTP_FRAME = buildHttpFrame(
+  200,
+  GIT_RECEIVE_RES_CT,
+  STATIC_PUSH_MAIN_SIDEBAND_OK_BUF,
+  'Cache-Control: no-cache\r\n',
+);
+
+export const STATIC_PUSH_MAIN_RAW_OK_HTTP_FRAME = buildHttpFrame(
+  200,
+  GIT_RECEIVE_RES_CT,
+  STATIC_PUSH_MAIN_RAW_OK_BUF,
+  'Cache-Control: no-cache\r\n',
+);
+
+export function getStaticV2UploadAdvertisement(): Buffer {
+  return V2_ADV_COMBINED;
 }
 
 /**
- * 单个 Git 仓库的内存存储与协议处理器
+ * 单个 Git 仓库实例（对象库 + Refs + 协议处理）
  */
 export class GitRepositoryStore {
-  readonly objects = new Map<string, StoredGitObject>();
-  /** 完整 ref 名称 -> oid，例如 'refs/heads/main' -> sha, 'refs/tags/v1' -> sha */
+  readonly objects = new Map<string, GitObject>();
   readonly refs = new Map<string, string>();
   defaultBranch = 'main';
-  refsVersion = 1;
+  version = 0;
 
-  // 协议层响应缓存（refsVersion 不变时直接 O(1) 零计算返回）
+  /** 缓存的响应 Buffer 与完整 HTTP/1.1 响应帧，在 bumpVersion 时统一失效 */
   cachedReceiveAdvBuf: Buffer | null = null;
+  cachedReceiveAdvHttpFrame: Buffer | null = null;
   cachedUploadAdvV0Buf: Buffer | null = null;
-  readonly cachedV2LsRefs = new Map<string, Buffer>();
-  readonly cachedV2Fetch = new Map<string, Buffer>();
-  /** 原始请求体直通缓存，命中时免去 pkt-line 解码器开销 */
-  readonly cachedV2RawBody = new Map<string, Buffer>();
+  cachedUploadAdvV0HttpFrame: Buffer | null = null;
+  cachedV2LsRefs = new Map<string, Buffer>();
+  cachedV2Fetch = new Map<string, Buffer>();
+  cachedV2RawBody = new Map<string, Buffer>();
+  cachedV2RawBodyHttpFrame = new Map<string, Buffer>();
+  cachedV0RawBodyHttpFrame = new Map<string, Buffer>();
+  cachedV0FetchHttpFrame = new Map<string, Buffer>();
 
   bumpVersion(): void {
-    this.refsVersion++;
+    this.version++;
     this.cachedReceiveAdvBuf = null;
+    this.cachedReceiveAdvHttpFrame = null;
     this.cachedUploadAdvV0Buf = null;
+    this.cachedUploadAdvV0HttpFrame = null;
     this.cachedV2LsRefs.clear();
     this.cachedV2Fetch.clear();
     this.cachedV2RawBody.clear();
+    this.cachedV2RawBodyHttpFrame.clear();
+    this.cachedV0RawBodyHttpFrame.clear();
+    this.cachedV0FetchHttpFrame.clear();
   }
 
-  /** 写入对象并返回其 SHA-1 OID */
-  putObject(type: GitObjectType, data: Buffer, rawPackEntryBuf: Buffer | null = null): StoredGitObject {
+  putObject(type: GitObjectType, data: Buffer, prebuiltPackSlice: Buffer | null = null): GitObject {
     const oid = computeGitOid(type, data);
-    let existing = this.objects.get(oid);
+    const existing = this.objects.get(oid);
     if (existing) {
-      if (existing.packEntryBuf === null && rawPackEntryBuf !== null) {
-        existing.packEntryBuf = rawPackEntryBuf;
+      if (existing.packEntryBuf === null && prebuiltPackSlice !== null) {
+        existing.packEntryBuf = prebuiltPackSlice;
       }
       return existing;
     }
-    const stored: StoredGitObject = {
+    const obj: GitObject = {
       oid,
       type,
       data,
-      packEntryBuf: rawPackEntryBuf,
+      packEntryBuf: prebuiltPackSlice,
     };
-    this.objects.set(oid, stored);
-    return stored;
+    this.objects.set(oid, obj);
+    return obj;
   }
 
+  /** 读取并解析 Commit 对象 */
   getCommit(oid: string): ParsedCommit | null {
     const obj = this.objects.get(oid);
     if (!obj || obj.type !== 'commit') return null;
-    if (!obj.parsedCommit) obj.parsedCommit = decodeCommit(obj.data);
-    return obj.parsedCommit;
+    return decodeCommit(obj.data);
   }
 
+  /** 剥离 Annotated Tag（若有）返回最终指向的对象 OID */
+    getTag(oid: string): ParsedTag | null {
+    const obj = this.objects.get(oid);
+    if (!obj || obj.type !== 'tag') return null;
+    return decodeTag(obj.data);
+  }
+
+  peelTag(oid: string): string {
+    let cur = oid;
+    for (let i = 0; i < 8; i++) {
+      const obj = this.objects.get(cur);
+      if (!obj || obj.type !== 'tag') return cur;
+      const text = obj.data.toString('utf8');
+      const m = /^object ([0-9a-f]{40})$/m.exec(text);
+      if (!m) return cur;
+      cur = m[1]!;
+    }
+    return cur;
+  }
+
+  /** 读取并解析 Tree 对象 */
   getTree(oid: string): TreeEntry[] | null {
     const obj = this.objects.get(oid);
     if (!obj || obj.type !== 'tree') return null;
-    if (!obj.parsedTree) obj.parsedTree = decodeTree(obj.data);
-    return obj.parsedTree;
+    return decodeTree(obj.data);
   }
 
-  getTag(oid: string): ParsedTag | null {
-    const obj = this.objects.get(oid);
-    if (!obj || obj.type !== 'tag') return null;
-    if (!obj.parsedTag) obj.parsedTag = decodeTag(obj.data);
-    return obj.parsedTag;
-  }
-
-  /** 剥离 annotated tag 到最终非 tag 目标 OID */
-  peelTag(oid: string): string | null {
-    let cur = oid;
-    let guard = 0;
-    while (guard++ < 16) {
-      const obj = this.objects.get(cur);
-      if (!obj) return null;
-      if (obj.type !== 'tag') return cur;
-      const t = this.getTag(cur);
-      if (!t) return null;
-      cur = t.object;
+  /** 递归展开 Tree 为 `path -> blobOid` 平面映射 */
+  flattenTree(treeOid: string | null, prefix = '', out = new Map<string, string>()): Map<string, string> {
+    if (!treeOid) return out;
+    const entries = this.getTree(treeOid);
+    if (!entries) return out;
+    for (const e of entries) {
+      const fullPath = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.mode === '40000') {
+        this.flattenTree(e.oid, fullPath, out);
+      } else {
+        out.set(fullPath, e.oid);
+      }
     }
-    return null;
+    return out;
   }
 
-  /** 判断 ancestorOid 是否为 descendantOid 的祖先（含相等，带直接单亲快速短路） */
+  /** 从 `path -> blobOid` 平面映射递归生成嵌套 Tree 对象并返回根 Tree OID */
+  buildTreeFromMap(files: Map<string, string>): string {
+    interface DirNode {
+      blobs: Array<{ name: string; oid: string }>;
+      dirs: Map<string, DirNode>;
+    }
+    const makeDir = (): DirNode => ({ blobs: [], dirs: new Map() });
+    const root = makeDir();
+
+    for (const [filePath, oid] of files.entries()) {
+      const clean = filePath.replace(/^\/+|\/+$/g, '');
+      if (!clean) continue;
+      const parts = clean.split('/');
+      let cur = root;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const seg = parts[i]!;
+        let child = cur.dirs.get(seg);
+        if (!child) {
+          child = makeDir();
+          cur.dirs.set(seg, child);
+        }
+        cur = child;
+      }
+      cur.blobs.push({ name: parts[parts.length - 1]!, oid });
+    }
+
+    const writeNode = (node: DirNode): string => {
+      const entries: TreeEntry[] = [];
+      for (const b of node.blobs) {
+        entries.push({ mode: '100644', name: b.name, oid: b.oid });
+      }
+      for (const [dName, dNode] of node.dirs.entries()) {
+        const subOid = writeNode(dNode);
+        entries.push({ mode: '40000', name: dName, oid: subOid });
+      }
+      const treeBuf = encodeTree(entries);
+      return this.putObject('tree', treeBuf).oid;
+    };
+
+    return writeNode(root);
+  }
+
+  /** 判断 `ancestorOid` 是否为 `descendantOid` 的祖先提交 */
   isAncestor(ancestorOid: string, descendantOid: string): boolean {
     if (ancestorOid === descendantOid) return true;
     const direct = this.getCommit(descendantOid);
-    if (!direct) return false;
-    if (direct.parents.includes(ancestorOid)) return true;
+    if (direct && direct.parents.includes(ancestorOid)) return true;
+
     const visited = new Set<string>();
-    const queue: string[] = [...direct.parents];
+    const queue = [descendantOid];
     while (queue.length > 0) {
       const cur = queue.shift()!;
       if (cur === ancestorOid) return true;
       if (visited.has(cur)) continue;
       visited.add(cur);
-      const commit = this.getCommit(cur);
-      if (!commit) continue;
-      for (const p of commit.parents) {
+      const parsed = this.getCommit(cur);
+      if (!parsed) continue;
+      for (const p of parsed.parents) {
         if (p === ancestorOid) return true;
         if (!visited.has(p)) queue.push(p);
       }
@@ -486,474 +634,612 @@ export class GitRepositoryStore {
     return false;
   }
 
-  /** 查找两个 Commit 的最近公共祖先 (Merge Base) */
-  findMergeBase(oidA: string, oidB: string): string | null {
-    if (oidA === oidB) return oidA;
-    // 收集 A 的所有祖先及其最短距离
+  /** 查找两个 commit 最近的共同祖先 (LCA) */
+  findMergeBase(commitA: string, commitB: string): string | null {
     const ancestorsA = new Set<string>();
-    const qA: string[] = [oidA];
+    const qA = [commitA];
     while (qA.length > 0) {
       const c = qA.shift()!;
       if (ancestorsA.has(c)) continue;
       ancestorsA.add(c);
       const parsed = this.getCommit(c);
-      if (parsed) {
-        for (const p of parsed.parents) if (!ancestorsA.has(p)) qA.push(p);
-      }
+      if (parsed) qA.push(...parsed.parents);
     }
-    // 从 B 按 BFS 查找第一个出现在 ancestorsA 中的提交
+
     const visitedB = new Set<string>();
-    const qB: string[] = [oidB];
+    const qB = [commitB];
     while (qB.length > 0) {
       const c = qB.shift()!;
       if (ancestorsA.has(c)) return c;
       if (visitedB.has(c)) continue;
       visitedB.add(c);
       const parsed = this.getCommit(c);
-      if (parsed) {
-        for (const p of parsed.parents) if (!visitedB.has(p)) qB.push(p);
-      }
+      if (parsed) qB.push(...parsed.parents);
     }
     return null;
   }
 
-  /** 将某棵 Tree 递归展开为 Map<相对路径, blobOid> */
-  flattenTree(treeOid: string | null, prefix = '', out = new Map<string, string>()): Map<string, string> {
-    if (!treeOid) return out;
-    const entries = this.getTree(treeOid);
-    if (!entries) return out;
-    for (const entry of entries) {
-      const fullPath = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.mode === '40000') {
-        this.flattenTree(entry.oid, fullPath, out);
-      } else if (entry.mode !== '160000') {
-        out.set(fullPath, entry.oid);
-      }
-    }
-    return out;
-  }
-
-  /** 根据 Map<相对路径, blobOid> 构建完整的嵌套 Git Tree 并存入对象库，返回根 treeOid */
-  buildTreeFromMap(filesMap: Map<string, string>): string {
-    interface DirNode {
-      files: Map<string, string>;
-      dirs: Map<string, DirNode>;
-    }
-    const makeNode = (): DirNode => ({ files: new Map(), dirs: new Map() });
-    const root = makeNode();
-    for (const [filePath, blobOid] of filesMap.entries()) {
-      const clean = filePath.replace(/^\/+|\/+$/g, '');
-      if (!clean) continue;
-      const parts = clean.split('/');
-      let cur = root;
-      for (let i = 0; i < parts.length - 1; i++) {
-        const seg = parts[i];
-        let next = cur.dirs.get(seg);
-        if (!next) {
-          next = makeNode();
-          cur.dirs.set(seg, next);
-        }
-        cur = next;
-      }
-      cur.files.set(parts[parts.length - 1], blobOid);
-    }
-    const writeDir = (node: DirNode): string => {
-      const entries: TreeEntry[] = [];
-      for (const [name, oid] of node.files.entries()) {
-        entries.push({ mode: '100644', name, oid });
-      }
-      for (const [name, child] of node.dirs.entries()) {
-        const childOid = writeDir(child);
-        entries.push({ mode: '40000', name, oid: childOid });
-      }
-      const treeBuf = encodeTree(entries);
-      return this.putObject('tree', treeBuf).oid;
-    };
-    return writeDir(root);
-  }
-
-  /** 计算从 baseCommit 到 headCommit 的三点 Tree Diff (mergeBase...head) */
-  diffCommits(baseCommitOid: string, headCommitOid: string): ChangedFileDiff[] {
-    const ancestorOid = this.findMergeBase(baseCommitOid, headCommitOid) ?? baseCommitOid;
-    const ancCommit = this.getCommit(ancestorOid);
+  /** 三路合并：若无冲突返回合并后的新 Tree OID，存在冲突返回 null */
+  threeWayMergeTrees(baseCommitOid: string, headCommitOid: string): string | null {
+    const baseCommit = this.getCommit(baseCommitOid);
     const headCommit = this.getCommit(headCommitOid);
-    const baseMap = this.flattenTree(ancCommit ? ancCommit.tree : null);
-    const headMap = this.flattenTree(headCommit ? headCommit.tree : null);
+    if (!baseCommit || !headCommit) return null;
 
-    const allPaths = new Set<string>([...baseMap.keys(), ...headMap.keys()]);
-    const sortedPaths = [...allPaths].sort();
+    const lcaOid = this.findMergeBase(baseCommitOid, headCommitOid);
+    const lcaTree = lcaOid ? (this.getCommit(lcaOid)?.tree ?? null) : null;
+
+    const lcaFiles = this.flattenTree(lcaTree);
+    const baseFiles = this.flattenTree(baseCommit.tree);
+    const headFiles = this.flattenTree(headCommit.tree);
+
+    const allPaths = new Set<string>([...lcaFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
+    const merged = new Map<string, string>();
+
+    for (const p of allPaths) {
+      const o = lcaFiles.get(p);
+      const a = baseFiles.get(p);
+      const b = headFiles.get(p);
+
+      if (a === b) {
+        if (a !== undefined) merged.set(p, a);
+      } else if (a === o) {
+        if (b !== undefined) merged.set(p, b);
+      } else if (b === o) {
+        if (a !== undefined) merged.set(p, a);
+      } else {
+        return null;
+      }
+    }
+    return this.buildTreeFromMap(merged);
+  }
+
+  /** 计算从 baseCommit 到 headCommit 的文件变更列表 */
+  diffCommits(baseCommitOid: string, headCommitOid: string): ChangedFileDiff[] {
+    const baseCommit = this.getCommit(baseCommitOid);
+    const headCommit = this.getCommit(headCommitOid);
+    const baseFiles = this.flattenTree(baseCommit?.tree ?? null);
+    const headFiles = this.flattenTree(headCommit?.tree ?? null);
+
+    const allPaths = [...new Set<string>([...baseFiles.keys(), ...headFiles.keys()])].sort();
     const diffs: ChangedFileDiff[] = [];
 
-    for (const path of sortedPaths) {
-      const oldOid = baseMap.get(path);
-      const newOid = headMap.get(path);
+    for (const filename of allPaths) {
+      const oldOid = baseFiles.get(filename);
+      const newOid = headFiles.get(filename);
       if (oldOid === newOid) continue;
 
-      const countLines = (oid: string | undefined): string[] => {
-        if (!oid) return [];
-        const obj = this.objects.get(oid);
-        if (!obj) return [];
-        const text = obj.data.toString('utf8');
-        if (text.length === 0) return [];
-        const lines = text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n');
-        return lines;
+      const countLines = (oid?: string): number => {
+        if (!oid) return 0;
+        const text = this.objects.get(oid)?.data.toString('utf8') ?? '';
+        if (text.length === 0) return 0;
+        return text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length;
       };
 
       if (!oldOid && newOid) {
-        const add = Math.max(1, countLines(newOid).length);
-        diffs.push({ filename: path, status: 'added', additions: add, deletions: 0, changes: add });
+        const adds = Math.max(1, countLines(newOid));
+        diffs.push({ filename, status: 'added', sha: newOid, additions: adds, deletions: 0, changes: adds });
       } else if (oldOid && !newOid) {
-        const del = Math.max(1, countLines(oldOid).length);
-        diffs.push({ filename: path, status: 'removed', additions: 0, deletions: del, changes: del });
+        const dels = Math.max(1, countLines(oldOid));
+        diffs.push({ filename, status: 'removed', sha: oldOid, additions: 0, deletions: dels, changes: dels });
       } else if (oldOid && newOid) {
-        const oldLines = countLines(oldOid);
-        const newLines = countLines(newOid);
-        // 快速前后缀裁剪统计变更行数
-        let p = 0;
-        while (p < oldLines.length && p < newLines.length && oldLines[p] === newLines[p]) p++;
-        let sOld = oldLines.length - 1;
-        let sNew = newLines.length - 1;
-        while (sOld >= p && sNew >= p && oldLines[sOld] === newLines[sNew]) {
-          sOld--;
-          sNew--;
-        }
-        const del = Math.max(0, sOld - p + 1);
-        const add = Math.max(0, sNew - p + 1);
-        const finalAdd = add === 0 && del === 0 ? 1 : add;
+        const oldLines = (this.objects.get(oldOid)?.data.toString('utf8') ?? '').split('\n');
+        const newLines = (this.objects.get(newOid)?.data.toString('utf8') ?? '').split('\n');
+        const oldSet = new Set(oldLines);
+        const newSet = new Set(newLines);
+        let adds = 0;
+        let dels = 0;
+        for (const l of newLines) if (!oldSet.has(l)) adds++;
+        for (const l of oldLines) if (!newSet.has(l)) dels++;
+        if (adds === 0 && dels === 0) adds = 1;
         diffs.push({
-          filename: path,
+          filename,
           status: 'modified',
-          additions: finalAdd,
-          deletions: del,
-          changes: finalAdd + del,
+          sha: newOid,
+          additions: adds,
+          deletions: dels,
+          changes: adds + dels,
         });
       }
     }
     return diffs;
   }
 
-  /** 执行三方 Tree 合并（返回合并后的新 Commit OID，冲突则返回 null） */
-  mergeBranches(
-    baseBranch: string,
-    headBranch: string,
-    method: 'merge' | 'squash' | 'rebase',
-    title: string,
-    authorName?: string,
-    authorEmail?: string,
-  ): { ok: true; commitSha: string } | { ok: false; reason: string } {
-    const baseRef = `refs/heads/${baseBranch}`;
-    const headRef = `refs/heads/${headBranch}`;
-    const baseSha = this.refs.get(baseRef);
-    const headSha = this.refs.get(headRef);
-    if (!baseSha || !headSha) return { ok: false, reason: 'Branch reference not found' };
-
-    const ancestorSha = this.findMergeBase(baseSha, headSha);
-    const ancTree = ancestorSha ? (this.getCommit(ancestorSha)?.tree ?? null) : null;
-    const baseTree = this.getCommit(baseSha)?.tree ?? null;
-    const headTree = this.getCommit(headSha)?.tree ?? null;
-
-    const ancFiles = this.flattenTree(ancTree);
-    const baseFiles = this.flattenTree(baseTree);
-    const headFiles = this.flattenTree(headTree);
-
-    const allPaths = new Set<string>([...ancFiles.keys(), ...baseFiles.keys(), ...headFiles.keys()]);
-    const mergedFiles = new Map<string, string>();
-
-    for (const p of allPaths) {
-      const a = ancFiles.get(p);
-      const b = baseFiles.get(p);
-      const h = headFiles.get(p);
-
-      if (b === h) {
-        if (b !== undefined) mergedFiles.set(p, b);
-      } else if (b === a) {
-        // 仅 head 修改（新增、修改或删除）
-        if (h !== undefined) mergedFiles.set(p, h);
-      } else if (h === a) {
-        // 仅 base 修改
-        if (b !== undefined) mergedFiles.set(p, b);
-      } else {
-        // 双方都对同一路径做出了不同修改 -> 冲突！
-        return { ok: false, reason: `Merge conflict in ${p}` };
+  /** 收集仅在 head 不在 stopAt 祖先链上的 commit（按拓扑从旧到新排列） */
+  collectExclusiveHistory(headOid: string, stopAtOid: string | null): string[] {
+    const result: string[] = [];
+    const visited = new Set<string>();
+    const dfs = (oid: string): void => {
+      if (visited.has(oid) || oid === stopAtOid) return;
+      visited.add(oid);
+      const parsed = this.getCommit(oid);
+      if (!parsed) return;
+      if (parsed.parents[0]) {
+        dfs(parsed.parents[0]);
       }
-    }
-
-    // 检查目录/文件前缀冲突（如一方存了 a/b，另一方存了 a）
-    const finalPaths = [...mergedFiles.keys()].sort();
-    for (let i = 1; i < finalPaths.length; i++) {
-      if (finalPaths[i].startsWith(`${finalPaths[i - 1]}/`)) {
-        return { ok: false, reason: 'File/directory path conflict' };
-      }
-    }
-
-    const mergedTreeOid = this.buildTreeFromMap(mergedFiles);
-    const parents = method === 'squash' || method === 'rebase' ? [baseSha] : [baseSha, headSha];
-    const commitBuf = encodeCommit({
-      tree: mergedTreeOid,
-      parents,
-      message: title || `Merge branch '${headBranch}' into ${baseBranch}`,
-      authorName,
-      authorEmail,
-    });
-    const newCommit = this.putObject('commit', commitBuf);
-    this.refs.set(baseRef, newCommit.oid);
-    this.bumpVersion();
-    return { ok: true, commitSha: newCommit.oid };
+      result.push(oid);
+    };
+    dfs(headOid);
+    return result;
   }
 
-  /** 解包客户端上传的 Packfile 并写入本仓库对象存储 */
+  /** 解析客户端推送的 Packfile v2 并原子性写入本地对象库 */
   unpackPackfile(pack: Buffer): void {
-    if (pack.length === 0) return;
-    if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') {
-      throw new Error('Malformed pack header');
+    if (pack.length < 32) {
+      throw new Error('Packfile too short');
+    }
+    if (!pack.subarray(0, 4).equals(PACK_SIG)) {
+      throw new Error('Invalid PACK signature');
     }
     const version = pack.readUInt32BE(4);
     if (version !== 2 && version !== 3) {
       throw new Error(`Unsupported pack version ${version}`);
     }
-    const count = pack.readUInt32BE(8);
+    const numObjects = pack.readUInt32BE(8);
     const bodyEnd = pack.length - 20;
-    const expectedSum = pack.subarray(bodyEnd).toString('hex');
-    const actualSum = createHash('sha1').update(pack.subarray(0, bodyEnd)).digest('hex');
-    if (expectedSum !== actualSum) {
+
+    // 零字符串分配校验 pack 尾部 20 字节 SHA-1
+    const actualDigest = createHash('sha1').update(pack.subarray(0, bodyEnd)).digest();
+    if (!actualDigest.equals(pack.subarray(bodyEnd))) {
       throw new Error('Packfile checksum mismatch');
     }
 
     interface PendingEntry {
       offset: number;
       typeCode: number;
-      rawPayload: Buffer;
-      rawNonDeltaSlice: Buffer | null;
       baseOffset?: number;
       baseOid?: string;
+      data: Buffer;
+      rawNonDeltaSlice: Buffer | null;
       resolvedType?: GitObjectType;
       resolvedData?: Buffer;
-      oid?: string;
     }
 
-    const entries: PendingEntry[] = [];
-    const byOffset = new Map<number, PendingEntry>();
+    const entries: PendingEntry[] = new Array(numObjects);
+    let hasOfsDelta = false;
+    let hasRefDelta = false;
     let offset = 12;
 
-    for (let i = 0; i < count; i++) {
+    for (let i = 0; i < numObjects; i++) {
       const entryStart = offset;
-      if (offset >= bodyEnd) throw new Error('Pack truncated at entry header');
-      let b = pack[offset++];
-      const typeCode = (b >> 4) & 0x07;
-      let declaredSize = b & 0x0f;
+      const first = pack[offset++]!;
+      const typeCode = (first >> 4) & 0x07;
+      let declaredSize = first & 0x0f;
       let shift = 4;
-      while (b & 0x80) {
-        if (offset >= bodyEnd) throw new Error('Pack varint truncated');
-        b = pack[offset++];
-        declaredSize += (b & 0x7f) * 2 ** shift;
+      let cur = first;
+      while ((cur & 0x80) !== 0) {
+        cur = pack[offset++]!;
+        declaredSize += (cur & 0x7f) * 2 ** shift;
         shift += 7;
       }
 
       let baseOffset: number | undefined;
       let baseOid: string | undefined;
+
       if (typeCode === 6) {
-        // OFS_DELTA
-        let c = pack[offset++];
-        let negOff = c & 0x7f;
-        while (c & 0x80) {
-          c = pack[offset++];
-          negOff = (negOff + 1) * 128 + (c & 0x7f);
+        hasOfsDelta = true;
+        let b = pack[offset++]!;
+        let negOff = b & 0x7f;
+        while ((b & 0x80) !== 0) {
+          b = pack[offset++]!;
+          negOff = ((negOff + 1) << 7) | (b & 0x7f);
         }
         baseOffset = entryStart - negOff;
       } else if (typeCode === 7) {
-        // REF_DELTA
+        hasRefDelta = true;
         baseOid = pack.subarray(offset, offset + 20).toString('hex');
         offset += 20;
-      } else if (!CODE_TO_TYPE[typeCode]) {
-        throw new Error(`Unknown pack object type ${typeCode}`);
       }
 
-      const inf = inflateSync(pack.subarray(offset, bodyEnd), { info: true }) as unknown as {
+      const chunkSize = Math.max(128, Math.min(16384, declaredSize + 16));
+      const inf = inflateSync(pack.subarray(offset, bodyEnd), {
+        info: true,
+        chunkSize,
+      }) as unknown as {
         buffer: Buffer;
         engine: { bytesWritten: number };
       };
       if (inf.buffer.length !== declaredSize) {
-        throw new Error('Inflated size mismatch');
+        throw new Error(`Inflated size mismatch: expected ${declaredSize}, got ${inf.buffer.length}`);
       }
       const nextOffset = offset + inf.engine.bytesWritten;
-      // 非 delta 对象可直接零拷贝保存原始压缩块，供后续 clone/fetch 直接复用！
       const rawNonDeltaSlice = typeCode >= 1 && typeCode <= 4 ? pack.subarray(entryStart, nextOffset) : null;
       offset = nextOffset;
 
-      const entry: PendingEntry = {
+      entries[i] = {
         offset: entryStart,
         typeCode,
-        rawPayload: inf.buffer,
-        rawNonDeltaSlice,
         baseOffset,
         baseOid,
+        data: inf.buffer,
+        rawNonDeltaSlice,
       };
-      entries.push(entry);
-      byOffset.set(entryStart, entry);
     }
 
-    if (offset !== bodyEnd) {
-      throw new Error('Trailing bytes before pack checksum');
-    }
-
-    const byOid = new Map<string, PendingEntry>();
-    const resolveEntry = (e: PendingEntry): { type: GitObjectType; data: Buffer; oid: string } => {
-      if (e.resolvedType && e.resolvedData && e.oid) {
-        return { type: e.resolvedType, data: e.resolvedData, oid: e.oid };
+    // 快速无 delta 直通路径：跳过 Map 构建与递归解析
+    if (!hasOfsDelta && !hasRefDelta) {
+      for (let i = 0; i < numObjects; i++) {
+        const e = entries[i]!;
+        const type = CODE_TO_TYPE[e.typeCode];
+        if (!type) throw new Error(`Unknown pack object type code: ${e.typeCode}`);
+        this.putObject(type, e.data, e.rawNonDeltaSlice);
       }
-      let type: GitObjectType;
-      let data: Buffer;
-      if (e.typeCode === 6) {
-        const baseE = byOffset.get(e.baseOffset!);
-        if (!baseE) throw new Error('Missing OFS_DELTA base');
-        const resolvedBase = resolveEntry(baseE);
-        type = resolvedBase.type;
-        data = applyGitDelta(resolvedBase.data, e.rawPayload);
-      } else if (e.typeCode === 7) {
-        const inPack = byOid.get(e.baseOid!);
-        if (inPack) {
-          const resolvedBase = resolveEntry(inPack);
-          type = resolvedBase.type;
-          data = applyGitDelta(resolvedBase.data, e.rawPayload);
+      return;
+    }
+
+    const byOffset = hasOfsDelta ? new Map<number, PendingEntry>() : null;
+    if (byOffset) {
+      for (const e of entries) byOffset.set(e.offset, e);
+    }
+
+    const byOid = hasRefDelta ? new Map<string, PendingEntry>() : null;
+    if (byOid) {
+      for (const e of entries) {
+        if (e.typeCode >= 1 && e.typeCode <= 4) {
+          const type = CODE_TO_TYPE[e.typeCode]!;
+          e.resolvedType = type;
+          e.resolvedData = e.data;
+          const stored = this.putObject(type, e.data, e.rawNonDeltaSlice);
+          byOid.set(stored.oid, e);
+        }
+      }
+    }
+
+    const resolveEntry = (entry: PendingEntry): { type: GitObjectType; data: Buffer } => {
+      if (entry.resolvedType && entry.resolvedData) {
+        return { type: entry.resolvedType, data: entry.resolvedData };
+      }
+
+      if (entry.typeCode >= 1 && entry.typeCode <= 4) {
+        const type = CODE_TO_TYPE[entry.typeCode]!;
+        entry.resolvedType = type;
+        entry.resolvedData = entry.data;
+        const stored = this.putObject(type, entry.data, entry.rawNonDeltaSlice);
+        byOid?.set(stored.oid, entry);
+        return { type, data: entry.data };
+      }
+
+      let baseType: GitObjectType;
+      let baseData: Buffer;
+
+      if (entry.typeCode === 6) {
+        const baseEntry = byOffset?.get(entry.baseOffset!);
+        if (!baseEntry) throw new Error(`Missing OFS_DELTA base at offset ${entry.baseOffset}`);
+        const resolved = resolveEntry(baseEntry);
+        baseType = resolved.type;
+        baseData = resolved.data;
+      } else if (entry.typeCode === 7) {
+        const existing = this.objects.get(entry.baseOid!);
+        if (existing) {
+          baseType = existing.type;
+          baseData = existing.data;
         } else {
-          const existing = this.objects.get(e.baseOid!);
-          if (!existing) throw new Error(`Missing REF_DELTA base ${e.baseOid}`);
-          type = existing.type;
-          data = applyGitDelta(existing.data, e.rawPayload);
+          const baseEntry = byOid?.get(entry.baseOid!);
+          if (!baseEntry) throw new Error(`Missing REF_DELTA base ${entry.baseOid}`);
+          const resolved = resolveEntry(baseEntry);
+          baseType = resolved.type;
+          baseData = resolved.data;
         }
       } else {
-        type = CODE_TO_TYPE[e.typeCode]!;
-        data = e.rawPayload;
+        throw new Error(`Unknown pack object type code: ${entry.typeCode}`);
       }
-      const stored = this.putObject(type, data, e.rawNonDeltaSlice);
-      e.resolvedType = type;
-      e.resolvedData = data;
-      e.oid = stored.oid;
-      byOid.set(stored.oid, e);
-      return { type, data, oid: stored.oid };
+
+      const finalData = applyGitDelta(baseData, entry.data);
+      entry.resolvedType = baseType;
+      entry.resolvedData = finalData;
+      const stored = this.putObject(baseType, finalData, null);
+      byOid?.set(stored.oid, entry);
+      return { type: baseType, data: finalData };
     };
 
-    for (let i = 0; i < entries.length; i++) {
-      resolveEntry(entries[i]);
+    for (const entry of entries) {
+      resolveEntry(entry);
     }
   }
 
-  /** 构建 v0 info/refs?service=git-receive-pack 广播响应（带缓存） */
-  buildReceivePackAdv(): Buffer {
-    if (this.cachedReceiveAdvBuf) return this.cachedReceiveAdvBuf;
-    const caps = 'report-status delete-refs side-band-64k quiet atomic ofs-delta agent=git/2.45.0 object-format=sha1';
-    const sortedRefs = [...this.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    const items: Array<string | 'flush'> = ['# service=git-receive-pack\n', 'flush'];
-    if (sortedRefs.length === 0) {
-      items.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
-    } else {
-      for (let i = 0; i < sortedRefs.length; i++) {
-        const [refName, oid] = sortedRefs[i];
-        items.push(i === 0 ? `${oid} ${refName}\0${caps}\n` : `${oid} ${refName}\n`);
-      }
-    }
-    items.push('flush');
-    this.cachedReceiveAdvBuf = pktSequence(items);
-    return this.cachedReceiveAdvBuf;
-  }
-
-  /** 构建 v0 info/refs?service=git-upload-pack 广播响应（带缓存） */
+  /** 构建 Smart HTTP v0 upload-pack refs 列表 */
   buildUploadPackAdvV0(): Buffer {
     if (this.cachedUploadAdvV0Buf) return this.cachedUploadAdvV0Buf;
-    const defaultRef = `refs/heads/${this.defaultBranch}`;
-    const headOid = this.refs.get(defaultRef) ?? (this.refs.size > 0 ? [...this.refs.values()][0] : null);
-    const caps = `multi_ack multi_ack_detailed thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not no-progress include-tag symref=HEAD:${defaultRef} agent=git/2.45.0 object-format=sha1`;
 
-    const items: Array<string | 'flush'> = ['# service=git-upload-pack\n', 'flush'];
-    const sortedRefs = [...this.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    if (sortedRefs.length === 0 || !headOid) {
-      items.push(`${ZERO_OID} capabilities^{}\0${caps}\n`);
+    const caps = 'multi_ack_detailed no-done side-band-64k thin-pack ofs-delta shallow agent=git/makefun-forge-1.0';
+    const sortedRefs = [...this.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const lines: string[] = ['# service=git-upload-pack\n'];
+    const headTarget = `refs/heads/${this.defaultBranch}`;
+    const headOid = this.refs.get(headTarget);
+    const symrefCap = ` symref=HEAD:${headTarget}`;
+
+    const chunks: Buffer[] = [pktLine('# service=git-upload-pack\n'), FLUSH_PKT];
+
+    if (sortedRefs.length === 0) {
+      chunks.push(pktLine(`${ZERO_SHA} capabilities^{}\0${caps}${symrefCap}\n`));
     } else {
-      items.push(`${headOid} HEAD\0${caps}\n`);
+      let sentCaps = false;
+      if (headOid) {
+        chunks.push(pktLine(`${headOid} HEAD\0${caps}${symrefCap}\n`));
+        sentCaps = true;
+      }
       for (const [refName, oid] of sortedRefs) {
-        items.push(`${oid} ${refName}\n`);
-        const obj = this.objects.get(oid);
-        if (obj && obj.type === 'tag') {
-          const peeled = this.peelTag(oid);
-          if (peeled) items.push(`${peeled} ${refName}^{}\n`);
+        if (!sentCaps) {
+          chunks.push(pktLine(`${oid} ${refName}\0${caps}${symrefCap}\n`));
+          sentCaps = true;
+        } else {
+          chunks.push(pktLine(`${oid} ${refName}\n`));
         }
       }
     }
-    items.push('flush');
-    this.cachedUploadAdvV0Buf = pktSequence(items);
-    return this.cachedUploadAdvV0Buf;
+    void lines;
+    chunks.push(FLUSH_PKT);
+    const out = Buffer.concat(chunks);
+    this.cachedUploadAdvV0Buf = out;
+    return out;
   }
 
-  /** 处理 Protocol v2 ls-refs（带参数级缓存） */
-  handleV2LsRefs(argLines: string[], cacheKey: string): Buffer {
-    const hit = this.cachedV2LsRefs.get(cacheKey);
-    if (hit) return hit;
+  buildUploadPackAdvV0HttpFrame(): Buffer {
+    if (this.cachedUploadAdvV0HttpFrame) return this.cachedUploadAdvV0HttpFrame;
+    const frame = buildHttpFrame(
+      200,
+      GIT_UPLOAD_ADV_CT,
+      this.buildUploadPackAdvV0(),
+      'Cache-Control: no-cache\r\n',
+    );
+    this.cachedUploadAdvV0HttpFrame = frame;
+    return frame;
+  }
 
-    let peel = false;
-    let symrefs = false;
-    let unborn = false;
-    const prefixes: string[] = [];
-    for (const raw of argLines) {
-      const line = raw.replace(/\r?\n$/, '');
-      if (line === 'peel') peel = true;
-      else if (line === 'symrefs') symrefs = true;
-      else if (line === 'unborn') unborn = true;
-      else if (line.startsWith('ref-prefix ')) prefixes.push(line.slice(11));
-    }
+  /** 构建 Smart HTTP receive-pack refs 列表 */
+  buildReceivePackAdv(): Buffer {
+    if (this.cachedReceiveAdvBuf) return this.cachedReceiveAdvBuf;
 
-    const matchesPrefix = (name: string): boolean =>
-      prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+    const caps = 'report-status report-status-v2 delete-refs side-band-64k ofs-delta atomic agent=git/makefun-forge-1.0';
+    const sortedRefs = [...this.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    const chunks: Buffer[] = [pktLine('# service=git-receive-pack\n'), FLUSH_PKT];
 
-    const outLines: Array<string | 'flush'> = [];
-    const defaultRef = `refs/heads/${this.defaultBranch}`;
-    const headOid = this.refs.get(defaultRef);
-
-    if (matchesPrefix('HEAD')) {
-      if (headOid) {
-        outLines.push(`${headOid} HEAD${symrefs ? ` symref-target:${defaultRef}` : ''}\n`);
-      } else if (unborn) {
-        outLines.push(`unborn HEAD${symrefs ? ` symref-target:${defaultRef}` : ''}\n`);
+    if (sortedRefs.length === 0) {
+      chunks.push(pktLine(`${ZERO_SHA} capabilities^{}\0${caps}\n`));
+    } else {
+      for (let i = 0; i < sortedRefs.length; i++) {
+        const [refName, oid] = sortedRefs[i]!;
+        if (i === 0) {
+          chunks.push(pktLine(`${oid} ${refName}\0${caps}\n`));
+        } else {
+          chunks.push(pktLine(`${oid} ${refName}\n`));
+        }
       }
     }
+    chunks.push(FLUSH_PKT);
+    const out = Buffer.concat(chunks);
+    this.cachedReceiveAdvBuf = out;
+    return out;
+  }
 
-    const sortedRefs = [...this.refs.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-    for (const [refName, oid] of sortedRefs) {
-      if (!matchesPrefix(refName)) continue;
+  buildReceivePackAdvHttpFrame(): Buffer {
+    if (this.cachedReceiveAdvHttpFrame) return this.cachedReceiveAdvHttpFrame;
+    const frame = buildHttpFrame(
+      200,
+      GIT_RECEIVE_ADV_CT,
+      this.buildReceivePackAdv(),
+      'Cache-Control: no-cache\r\n',
+    );
+    this.cachedReceiveAdvHttpFrame = frame;
+    return frame;
+  }
+
+  /** 处理 Git Smart HTTP 请求入口（支持 v2 与 v0，内置完整 HTTP 帧缓存） */
+  handleUploadPackHttpFrame(rawBody: Buffer, wantsV2: boolean): Buffer {
+    const rawKey = rawBody.length <= 4096 ? rawBody.toString('latin1') : null;
+    if (wantsV2) {
+      if (rawKey !== null) {
+        const hit = this.cachedV2RawBodyHttpFrame.get(rawKey);
+        if (hit) return hit;
+      }
+      const out = this.handleUploadPack(rawBody, true);
+      const frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
+      if (rawKey !== null && this.cachedV2RawBodyHttpFrame.size < 32) {
+        this.cachedV2RawBodyHttpFrame.set(rawKey, frame);
+      }
+      return frame;
+    }
+
+    if (rawKey !== null) {
+      const hit = this.cachedV0RawBodyHttpFrame.get(rawKey);
+      if (hit) return hit;
+    }
+    const out = this.handleUploadPack(rawBody, false);
+    const frame = buildHttpFrame(200, GIT_UPLOAD_RES_CT, out, 'Cache-Control: no-cache\r\n');
+    if (rawKey !== null && this.cachedV0RawBodyHttpFrame.size < 32) {
+      this.cachedV0RawBodyHttpFrame.set(rawKey, frame);
+    }
+    return frame;
+  }
+
+  handleUploadPack(rawBody: Buffer, wantsV2: boolean): Buffer {
+    const { lines } = decodeRequestPktStream(rawBody, false);
+    if (wantsV2) {
+      let command = '';
+      for (const l of lines) {
+        if (l.startsWith('command=')) {
+          command = l.slice(8).trim();
+          break;
+        }
+      }
+      if (command === 'ls-refs') {
+        const cacheKey = rawBody.length <= 512 ? rawBody.toString('latin1') : null;
+        if (cacheKey !== null) {
+          const hit = this.cachedV2LsRefs.get(cacheKey);
+          if (hit) return hit;
+        }
+        const out = this.handleV2LsRefs(lines);
+        if (cacheKey !== null && this.cachedV2LsRefs.size < 16) {
+          this.cachedV2LsRefs.set(cacheKey, out);
+        }
+        return out;
+      }
+      if (command === 'fetch') {
+        const cacheKey = rawBody.length <= 512 ? rawBody.toString('latin1') : null;
+        if (cacheKey !== null) {
+          const hit = this.cachedV2Fetch.get(cacheKey);
+          if (hit) return hit;
+        }
+        const out = this.handleV2Fetch(lines);
+        if (cacheKey !== null && this.cachedV2Fetch.size < 16) {
+          this.cachedV2Fetch.set(cacheKey, out);
+        }
+        return out;
+      }
+    }
+    return this.handleV0Fetch(lines);
+  }
+
+  private handleV2LsRefs(lines: string[]): Buffer {
+    const prefixes: string[] = [];
+    let includeSymrefs = false;
+    let includePeel = false;
+
+    for (const l of lines) {
+      if (l === 'symrefs') includeSymrefs = true;
+      else if (l === 'peel') includePeel = true;
+      else if (l.startsWith('ref-prefix ')) prefixes.push(l.slice(11));
+    }
+
+    const matchPrefix = (refName: string): boolean => {
+      if (prefixes.length === 0) return true;
+      return prefixes.some((p) => refName.startsWith(p));
+    };
+
+    const outLines: string[] = [];
+    const defaultHeadRef = `refs/heads/${this.defaultBranch}`;
+    const headOid = this.refs.get(defaultHeadRef);
+
+    if (headOid && matchPrefix('HEAD')) {
+      outLines.push(includeSymrefs ? `${headOid} HEAD symref-target:${defaultHeadRef}\n` : `${headOid} HEAD\n`);
+    } else if (!headOid && matchPrefix('HEAD') && includeSymrefs) {
+      outLines.push(`unborn HEAD symref-target:${defaultHeadRef}\n`);
+    }
+
+    const sorted = [...this.refs.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+    for (const [refName, oid] of sorted) {
+      if (!matchPrefix(refName)) continue;
       let suffix = '';
-      if (symrefs && refName === 'HEAD') suffix += ` symref-target:${defaultRef}`;
-      if (peel) {
+      if (includePeel) {
         const obj = this.objects.get(oid);
-        if (obj && obj.type === 'tag') {
-          const peeledOid = this.peelTag(oid);
-          if (peeledOid) suffix += ` peeled:${peeledOid}`;
+        if (obj?.type === 'tag') {
+          suffix = ` peeled:${this.peelTag(oid)}`;
         }
       }
       outLines.push(`${oid} ${refName}${suffix}\n`);
     }
-    outLines.push('flush');
-    const buf = pktSequence(outLines);
-    if (this.cachedV2LsRefs.size < 32) this.cachedV2LsRefs.set(cacheKey, buf);
-    return buf;
+    return pktSequence(outLines, true);
   }
 
-  /** 计算 fetch 需要发送的对象集合与 shallow/unshallow 边界 */
-  computeFetchPlan(opts: {
-    wants: string[];
-    haves: string[];
-    clientShallow: string[];
-    depth?: number;
-  }): {
-    objectsToSend: StoredGitObject[];
-    shallowLines: string[];
-    unshallowLines: string[];
-    commonAcks: string[];
-  } {
-    const { wants, haves, clientShallow, depth } = opts;
-    const clientShallowSet = new Set<string>(clientShallow);
+  private handleV2Fetch(lines: string[]): Buffer {
+    const wants: string[] = [];
+    const haves: string[] = [];
+    const clientShallow: string[] = [];
+    let depth = 0;
 
-    // 1. 收集客户端已持有的对象闭包（遇到客户端的 shallow 边界提交时不向下遍历其 parents！）
+    for (const l of lines) {
+      if (l.startsWith('want ')) wants.push(l.slice(5).trim());
+      else if (l.startsWith('have ')) haves.push(l.slice(5).trim());
+      else if (l.startsWith('shallow ')) clientShallow.push(l.slice(8).trim());
+      else if (l.startsWith('deepen ')) depth = Math.max(1, parseInt(l.slice(7).trim(), 10) || 1);
+    }
+
+    const { objectsToSend, shallowCommits, unshallowCommits } = this.computeFetchPlan(
+      wants,
+      haves,
+      clientShallow,
+      depth,
+    );
+
+    const sections: Buffer[] = [];
+    if (shallowCommits.length > 0 || unshallowCommits.length > 0) {
+      sections.push(pktLine('shallow-info\n'));
+      for (const s of shallowCommits) sections.push(pktLine(`shallow ${s}\n`));
+      for (const u of unshallowCommits) sections.push(pktLine(`unshallow ${u}\n`));
+      sections.push(DELIM_PKT);
+    }
+
+    sections.push(pktLine('packfile\n'));
+    const pack = assemblePackFromStored(objectsToSend);
+    sections.push(wrapSidebandBand1(pack));
+    return Buffer.concat(sections);
+  }
+
+  private handleV0Fetch(lines: string[]): Buffer {
+    const wants: string[] = [];
+    const haves: string[] = [];
+    const clientShallow: string[] = [];
+    let depth = 0;
+    let useSideband = false;
+    let seenDone = false;
+
+    for (const l of lines) {
+      if (l.startsWith('want ')) {
+        const rest = l.slice(5).trim();
+        const parts = rest.split(/\s+/);
+        wants.push(parts[0]!);
+        for (let i = 1; i < parts.length; i++) {
+          if (parts[i] === 'side-band-64k' || parts[i] === 'side-band') {
+            useSideband = true;
+          }
+        }
+      } else if (l.startsWith('have ')) {
+        haves.push(l.slice(5).trim());
+      } else if (l.startsWith('shallow ')) {
+        clientShallow.push(l.slice(8).trim());
+      } else if (l.startsWith('deepen ')) {
+        depth = Math.max(1, parseInt(l.slice(7).trim(), 10) || 1);
+      } else if (l === 'done') {
+        seenDone = true;
+      }
+    }
+
+    if (wants.length === 0) {
+      return pktSequence(['NAK\n'], false);
+    }
+
+    const { objectsToSend, shallowCommits, unshallowCommits } = this.computeFetchPlan(
+      wants,
+      haves,
+      clientShallow,
+      depth,
+    );
+
+    const outParts: Buffer[] = [];
+    for (const s of shallowCommits) outParts.push(pktLine(`shallow ${s}\n`));
+    for (const u of unshallowCommits) outParts.push(pktLine(`unshallow ${u}\n`));
+    if (shallowCommits.length > 0 || unshallowCommits.length > 0) {
+      outParts.push(FLUSH_PKT);
+    }
+
+    if (!seenDone && haves.length === 0 && depth === 0 && !useSideband) {
+      outParts.push(pktLine('NAK\n'));
+    } else {
+      outParts.push(pktLine('NAK\n'));
+    }
+
+    const pack = assemblePackFromStored(objectsToSend);
+    if (useSideband) {
+      outParts.push(wrapSidebandBand1(pack));
+    } else {
+      outParts.push(pack);
+    }
+    return Buffer.concat(outParts);
+  }
+
+  /** 计算浅克隆边界与待传输对象子图 */
+  private computeFetchPlan(
+    wants: string[],
+    haves: string[],
+    clientShallow: string[],
+    depth: number,
+  ): {
+    objectsToSend: GitObject[];
+    shallowCommits: string[];
+    unshallowCommits: string[];
+  } {
+    const clientShallowSet = new Set<string>(clientShallow);
     const haveObjSet = new Set<string>();
-    const commonAcks: string[] = [];
+
     const collectSubgraph = (rootOids: string[], stopCommitParentsAt?: Set<string>): Set<string> => {
       const seen = new Set<string>();
       const stack: string[] = [...rootOids];
@@ -986,6 +1272,7 @@ export class GitRepositoryStore {
       return seen;
     };
 
+    const commonAcks: string[] = [];
     for (const h of haves) {
       if (this.objects.has(h)) commonAcks.push(h);
     }
@@ -995,14 +1282,13 @@ export class GitRepositoryStore {
       }
     }
 
-    // 2. 根据是否有 depth 计算目标对象集合及新的浅边界
     const shallowLines: string[] = [];
     const unshallowLines: string[] = [];
     let wantObjSet: Set<string>;
 
-    if (depth !== undefined && depth >= 1) {
+    if (depth > 0) {
       const newShallowBoundary = new Set<string>();
-      const allowedCommits = new Map<string, number>(); // commitOid -> minGen (1-based)
+      const allowedCommits = new Map<string, number>();
       const extraNonCommits: string[] = [];
 
       const bfs: Array<{ oid: string; gen: number }> = [];
@@ -1047,16 +1333,15 @@ export class GitRepositoryStore {
       }
 
       for (const s of newShallowBoundary) {
-        if (!clientShallowSet.has(s)) shallowLines.push(`shallow ${s}\n`);
+        if (!clientShallowSet.has(s)) shallowLines.push(s);
       }
       for (const oldS of clientShallowSet) {
         if (allowedCommits.has(oldS) && !newShallowBoundary.has(oldS)) {
-          unshallowLines.push(`unshallow ${oldS}\n`);
+          unshallowLines.push(oldS);
         }
       }
 
       wantObjSet = new Set<string>();
-      // 只收集 allowedCommits 各自的 tree/blobs（不沿 parents 越界）
       const treeRoots: string[] = [...extraNonCommits];
       for (const cOid of allowedCommits.keys()) {
         wantObjSet.add(cOid);
@@ -1070,246 +1355,121 @@ export class GitRepositoryStore {
       wantObjSet = collectSubgraph(wants);
     }
 
-    const objectsToSend: StoredGitObject[] = [];
+    const objectsToSend: GitObject[] = [];
     for (const oid of wantObjSet) {
       if (haveObjSet.has(oid)) continue;
       const obj = this.objects.get(oid);
       if (obj) objectsToSend.push(obj);
     }
 
-    return { objectsToSend, shallowLines, unshallowLines, commonAcks };
+    return {
+      objectsToSend,
+      shallowCommits: shallowLines,
+      unshallowCommits: unshallowLines,
+    };
   }
 
-  /** 处理 Protocol v2 fetch（带 shallow clone 极速缓存） */
-  handleV2Fetch(argLines: string[], cacheKey: string | null): Buffer {
-    if (cacheKey !== null) {
-      const hit = this.cachedV2Fetch.get(cacheKey);
-      if (hit) return hit;
-    }
+  /** 处理 git-receive-pack编译 HTTP/1.1 二进制帧或动态构造） */
+  handleReceivePackHttpFrame(rawBody: Buffer): Buffer {
+    const { lines, trailingRaw } = decodeRequestPktStream(rawBody, true);
 
-    const wants: string[] = [];
-    const haves: string[] = [];
-    const clientShallow: string[] = [];
-    let depth: number | undefined;
-    let hasDone = false;
-
-    for (const raw of argLines) {
-      const line = raw.replace(/\r?\n$/, '');
-      if (line.startsWith('want ')) wants.push(line.slice(5).trim());
-      else if (line.startsWith('have ')) haves.push(line.slice(5).trim());
-      else if (line.startsWith('shallow ')) clientShallow.push(line.slice(8).trim());
-      else if (line.startsWith('deepen ')) {
-        const d = parseInt(line.slice(7).trim(), 10);
-        if (Number.isFinite(d) && d >= 1) depth = d;
-      } else if (line === 'done') hasDone = true;
-    }
-
-    const plan = this.computeFetchPlan({ wants, haves, clientShallow, depth });
-
-    if (!hasDone) {
-      const ackItems: Array<string | 'flush'> = ['acknowledgments\n'];
-      if (plan.commonAcks.length > 0) {
-        for (const a of plan.commonAcks) ackItems.push(`ACK ${a}\n`);
-      } else {
-        ackItems.push('NAK\n');
-      }
-      ackItems.push('flush');
-      return pktSequence(ackItems);
-    }
-
-    const parts: Buffer[] = [];
-    if (haves.length > 0) {
-      const ackSection: Array<string | 'delim'> = ['acknowledgments\n'];
-      if (plan.commonAcks.length > 0) {
-        for (const a of plan.commonAcks) ackSection.push(`ACK ${a}\n`);
-        ackSection.push('ready\n');
-      } else {
-        ackSection.push('NAK\n');
-      }
-      ackSection.push('delim');
-      parts.push(pktSequence(ackSection));
-    }
-
-    if (plan.shallowLines.length > 0 || plan.unshallowLines.length > 0) {
-      parts.push(pktSequence(['shallow-info\n', ...plan.shallowLines, ...plan.unshallowLines, 'delim']));
-    }
-
-    const packBuf = assemblePackFromStored(plan.objectsToSend);
-    parts.push(pktLine('packfile\n'));
-    parts.push(...wrapSidebandBand1(packBuf));
-    parts.push(FLUSH_PKT);
-
-    const out = Buffer.concat(parts);
-    if (cacheKey !== null && this.cachedV2Fetch.size < 16) {
-      this.cachedV2Fetch.set(cacheKey, out);
-    }
-    return out;
-  }
-
-  /** 处理 Protocol v0 upload-pack fetch */
-  handleV0Fetch(sections: string[][]): Buffer {
-    const allLines = sections.flat();
-    const wants: string[] = [];
-    const haves: string[] = [];
-    const clientShallow: string[] = [];
-    let depth: number | undefined;
-    let useSideband = false;
-
-    for (let i = 0; i < allLines.length; i++) {
-      const line = allLines[i].replace(/\r?\n$/, '');
-      if (line.startsWith('want ')) {
-        const rest = line.slice(5);
-        const sp = rest.indexOf(' ');
-        const oid = sp < 0 ? rest : rest.slice(0, sp);
-        if (sp >= 0 && rest.slice(sp + 1).includes('side-band')) useSideband = true;
-        wants.push(oid);
-      } else if (line.startsWith('have ')) {
-        haves.push(line.slice(5).trim());
-      } else if (line.startsWith('shallow ')) {
-        clientShallow.push(line.slice(8).trim());
-      } else if (line.startsWith('deepen ')) {
-        const d = parseInt(line.slice(7).trim(), 10);
-        if (Number.isFinite(d) && d >= 1) depth = d;
-      }
-    }
-
-    const plan = this.computeFetchPlan({ wants, haves, clientShallow, depth });
-    const parts: Buffer[] = [];
-
-    if (plan.shallowLines.length > 0 || plan.unshallowLines.length > 0) {
-      parts.push(pktSequence([...plan.shallowLines, ...plan.unshallowLines, 'flush']));
-    }
-
-    if (plan.commonAcks.length > 0) {
-      parts.push(pktLine(`ACK ${plan.commonAcks[plan.commonAcks.length - 1]}\n`));
-    } else {
-      parts.push(pktLine('NAK\n'));
-    }
-
-    const packBuf = assemblePackFromStored(plan.objectsToSend);
-    if (useSideband) {
-      parts.push(...wrapSidebandBand1(packBuf));
-      parts.push(FLUSH_PKT);
-    } else {
-      parts.push(packBuf);
-    }
-    return Buffer.concat(parts);
-  }
-
-  /** 处理 git-receive-pack Push 请求 */
-  handleReceivePack(rawBody: Buffer): Buffer {
-    const { sections, trailingRaw } = decodeRequestPktStream(rawBody, true);
-    const cmdLines = sections[0] ?? [];
-    let useSideband = false;
-    let reportStatus = false;
-
-    interface Cmd {
+    interface RefCmd {
       oldOid: string;
       newOid: string;
-      ref: string;
+      refName: string;
     }
-    const commands: Cmd[] = [];
 
-    for (let i = 0; i < cmdLines.length; i++) {
-      let line = cmdLines[i].replace(/\r?\n$/, '');
-      if (i === 0) {
-        const nul = line.indexOf('\0');
-        if (nul >= 0) {
-          const caps = line.slice(nul + 1);
-          if (caps.includes('side-band-64k') || caps.includes('side-band')) useSideband = true;
-          if (caps.includes('report-status')) reportStatus = true;
-          line = line.slice(0, nul);
+    const commands: RefCmd[] = [];
+    let reportStatus = false;
+    let useSideband = false;
+
+    for (const rawLine of lines) {
+      if (rawLine === '__FLUSH__' || rawLine === '__DELIM__') continue;
+      let line = rawLine;
+      const nulIdx = line.indexOf('\0');
+      if (nulIdx !== -1) {
+        const capStr = line.slice(nulIdx + 1);
+        line = line.slice(0, nulIdx);
+        const capTokens = capStr.split(/\s+/);
+        for (const c of capTokens) {
+          if (c === 'report-status' || c === 'report-status-v2') reportStatus = true;
+          else if (c === 'side-band-64k' || c === 'side-band') useSideband = true;
         }
       }
-      if (!line) continue;
-      const parts = line.split(' ');
-      if (parts.length >= 3) {
-        commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts.slice(2).join(' ') });
+      const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (.+)$/.exec(line);
+      if (m) {
+        commands.push({ oldOid: m[1]!, newOid: m[2]!, refName: m[3]!.trim() });
       }
     }
 
+    const needsPack = commands.some((c) => c.newOid !== ZERO_SHA);
     let unpackError: string | null = null;
-    if (trailingRaw.length > 0) {
+
+    if (needsPack && trailingRaw.length > 0) {
       try {
         this.unpackPackfile(trailingRaw);
       } catch (err) {
-        unpackError = err instanceof Error ? err.message : 'unpack failed';
+        unpackError = err instanceof Error ? err.message : String(err);
       }
+    } else if (needsPack && trailingRaw.length === 0) {
+      const missing = commands.some((c) => c.newOid !== ZERO_SHA && !this.objects.has(c.newOid));
+      if (missing) unpackError = 'Missing packfile for pushed objects';
     }
 
-    const reportLines: Array<string | 'flush'> = [];
-    if (unpackError !== null) {
-      reportLines.push(`unpack ${unpackError}\n`);
-      for (const cmd of commands) {
-        reportLines.push(`ng ${cmd.ref} unpacker error\n`);
-      }
-    } else {
-      reportLines.push('unpack ok\n');
-      let anyChanged = false;
-      for (const cmd of commands) {
-        const { oldOid, newOid, ref } = cmd;
-        if (!ref.startsWith('refs/')) {
-          reportLines.push(`ng ${ref} invalid ref\n`);
-          continue;
-        }
-        const curOid = this.refs.get(ref);
+    const reportLines: string[] = [unpackError ? `unpack ${unpackError}\n` : 'unpack ok\n'];
+    let anyUpdated = false;
 
-        if (newOid === ZERO_OID) {
-          // 删除 ref
-          if (oldOid !== ZERO_OID && curOid !== oldOid) {
-            reportLines.push(`ng ${ref} non-fast-forward\n`);
-          } else {
-            this.refs.delete(ref);
-            anyChanged = true;
-            reportLines.push(`ok ${ref}\n`);
-          }
-        } else if (oldOid === ZERO_OID) {
-          // 创建新 ref
-          if (curOid !== undefined) {
-            reportLines.push(`ng ${ref} non-fast-forward\n`);
-          } else if (!this.objects.has(newOid)) {
-            reportLines.push(`ng ${ref} missing object\n`);
-          } else {
-            this.refs.set(ref, newOid);
-            anyChanged = true;
-            reportLines.push(`ok ${ref}\n`);
-          }
+    for (const cmd of commands) {
+      if (unpackError) {
+        reportLines.push(`ng ${cmd.refName} ${unpackError}\n`);
+        continue;
+      }
+      const curOid = this.refs.get(cmd.refName) ?? ZERO_SHA;
+      if (curOid !== cmd.oldOid) {
+        reportLines.push(`ng ${cmd.refName} stale old oid (expected ${curOid})\n`);
+        continue;
+      }
+
+      if (cmd.newOid === ZERO_SHA) {
+        this.refs.delete(cmd.refName);
+        anyUpdated = true;
+        reportLines.push(`ok ${cmd.refName}\n`);
+      } else {
+        if (!this.objects.has(cmd.newOid)) {
+          reportLines.push(`ng ${cmd.refName} missing object ${cmd.newOid}\n`);
+        } else if (cmd.oldOid === ZERO_SHA) {
+          this.refs.set(cmd.refName, cmd.newOid);
+          anyUpdated = true;
+          reportLines.push(`ok ${cmd.refName}\n`);
+        } else if (cmd.refName.startsWith('refs/heads/') && !this.isAncestor(cmd.oldOid, cmd.newOid)) {
+          reportLines.push(`ng ${cmd.refName} non-fast-forward\n`);
         } else {
-          // 更新已有 ref（必须校验 fast-forward！）
-          if (curOid === undefined || curOid !== oldOid) {
-            reportLines.push(`ng ${ref} non-fast-forward\n`);
-          } else if (!this.objects.has(newOid)) {
-            reportLines.push(`ng ${ref} missing object\n`);
-          } else if (ref.startsWith('refs/heads/') && !this.isAncestor(oldOid, newOid)) {
-            reportLines.push(`ng ${ref} non-fast-forward\n`);
-          } else {
-            this.refs.set(ref, newOid);
-            anyChanged = true;
-            reportLines.push(`ok ${ref}\n`);
-          }
+          this.refs.set(cmd.refName, cmd.newOid);
+          anyUpdated = true;
+          reportLines.push(`ok ${cmd.refName}\n`);
         }
       }
-      if (anyChanged) this.bumpVersion();
     }
-    reportLines.push('flush');
+
+    if (anyUpdated) {
+      this.bumpVersion();
+    }
 
     if (!reportStatus) {
-      return useSideband ? FLUSH_PKT : Buffer.alloc(0);
+      return buildHttpFrame(200, GIT_RECEIVE_RES_CT, Buffer.alloc(0), 'Cache-Control: no-cache\r\n');
+    }
+    if (unpackError === null && reportLines.length === 2 && reportLines[1] === 'ok refs/heads/main\n') {
+      return useSideband ? STATIC_PUSH_MAIN_SIDEBAND_OK_HTTP_FRAME : STATIC_PUSH_MAIN_RAW_OK_HTTP_FRAME;
     }
 
-    if (
-      useSideband &&
-      unpackError === null &&
-      reportLines.length === 3 &&
-      reportLines[1] === 'ok refs/heads/main\n'
-    ) {
-      return STATIC_PUSH_MAIN_SIDEBAND_OK_BUF;
-    }
+    const statusPayload = pktSequence(reportLines, true);
+    const body = useSideband ? Buffer.concat([pktSideband(1, statusPayload), FLUSH_PKT]) : statusPayload;
+    return buildHttpFrame(200, GIT_RECEIVE_RES_CT, body, 'Cache-Control: no-cache\r\n');
+  }
 
-    const reportPkts = pktSequence(reportLines);
-    if (useSideband) {
-      return Buffer.concat([...wrapSidebandBand1(reportPkts), FLUSH_PKT]);
-    }
-    return reportPkts;
+  handleReceivePack(rawBody: Buffer): Buffer {
+    const frame = this.handleReceivePackHttpFrame(rawBody);
+    const sep = frame.indexOf('\r\n\r\n', 0, 'latin1');
+    return sep >= 0 ? frame.subarray(sep + 4) : frame;
   }
 }

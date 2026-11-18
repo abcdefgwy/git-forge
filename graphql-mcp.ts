@@ -291,14 +291,14 @@ export function executeSingleGraphQL(
       const rawMethod = String(input.mergeMethod ?? 'MERGE').toUpperCase();
       const method: 'merge' | 'squash' | 'rebase' =
         rawMethod === 'SQUASH' ? 'squash' : rawMethod === 'REBASE' ? 'rebase' : 'merge';
-      const merged = store.mergePullRequest(hit.repo, hit.pull, method);
+      const merged = store.mergePullRequest(hit.repo, hit.pull, { mergeMethod: method });
       if (!merged.ok) {
         return { data: null, errors: [{ message: merged.message }] };
       }
       return {
         data: {
           mergePullRequest: {
-            pullRequest: formatGqlPull(hit.repo, merged.pull, false, store),
+            pullRequest: formatGqlPull(hit.repo, hit.pull, false, store),
           },
         },
       };
@@ -886,4 +886,29 @@ export function handleMcpPostRaw(
 
   const err = mcpRpcError(id, -32601, `Method not found: ${method}`, 200);
   return { status: err.status, json: err.body };
+}
+
+
+/**
+ * 兼容裸 TCP 路由引擎的高性能调用适配器
+ */
+export function handleGraphql(
+  store: ForgeStore,
+  query: string,
+  variables: Record<string, unknown>,
+): Record<string, unknown> {
+  return executeSingleGraphQL({ query, variables }, store);
+}
+
+export function handleMcp(
+  store: ForgeStore,
+  rpc: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const hasId = 'id' in rpc && rpc.id !== undefined;
+  const method = typeof rpc.method === 'string' ? rpc.method : '';
+  if (!hasId && method.startsWith('notifications/')) {
+    return null;
+  }
+  const res = handleMcpPostRaw(JSON.stringify(rpc), store);
+  return res.json;
 }
