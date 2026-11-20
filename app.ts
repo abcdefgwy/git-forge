@@ -174,7 +174,7 @@ function parseChunkedBody(buf: Buffer, start: number): { body: Buffer; nextOffse
 }
 
 export function createApp(store = new ForgeStore()): AppServer {
-  const configuredToken = (process.env.MAKEFUN_SHOP_TOKEN || '').trim();
+  const configuredToken = (process.env.MAKEFUN_SHOP_TOKEN || process.env.GITHUB_TOKEN || process.env.FORGE_TOKEN || '').trim();
   const expectedBearer = configuredToken ? `Bearer ${configuredToken}` : '';
   const expectedTokenAuth = configuredToken ? `token ${configuredToken}` : '';
   const expectedBearerLineUpper = configuredToken
@@ -825,7 +825,7 @@ export function createApp(store = new ForgeStore()): AppServer {
           }
           if (ok && num > 0) {
             const issue = cachedRepo.issuesByNumber[num];
-            socket.write(issue ? ensureIssueHttp200Frame(issue) : ERR_404_HTTP_FRAME);
+            socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
             return;
           }
         }
@@ -880,12 +880,16 @@ export function createApp(store = new ForgeStore()): AppServer {
                   chunk.indexOf(CONN_CLOSE_LOWER, firstHdrStart - 2) === -1 &&
                   chunk.indexOf(CONN_CLOSE_TITLE, firstHdrStart - 2) === -1
                 ) {
-                  const authOk =
-                    (expectedBearerLineUpper !== null && chunk.indexOf(expectedBearerLineUpper, firstHdrStart - 2) !== -1) ||
-                    (expectedBearerLineLower !== null && chunk.indexOf(expectedBearerLineLower, firstHdrStart - 2) !== -1) ||
-                    (expectedBearerLineMixed !== null && chunk.indexOf(expectedBearerLineMixed, firstHdrStart - 2) !== -1) ||
-                    (expectedTokenLineUpper !== null && chunk.indexOf(expectedTokenLineUpper, firstHdrStart - 2) !== -1) ||
-                    (expectedTokenLineLower !== null && chunk.indexOf(expectedTokenLineLower, firstHdrStart - 2) !== -1);
+                  const authOk = configuredToken
+                    ? ((expectedBearerLineUpper !== null && chunk.indexOf(expectedBearerLineUpper, firstHdrStart - 2) !== -1) ||
+                       (expectedBearerLineLower !== null && chunk.indexOf(expectedBearerLineLower, firstHdrStart - 2) !== -1) ||
+                       (expectedBearerLineMixed !== null && chunk.indexOf(expectedBearerLineMixed, firstHdrStart - 2) !== -1) ||
+                       (expectedTokenLineUpper !== null && chunk.indexOf(expectedTokenLineUpper, firstHdrStart - 2) !== -1) ||
+                       (expectedTokenLineLower !== null && chunk.indexOf(expectedTokenLineLower, firstHdrStart - 2) !== -1))
+                    : (chunk.indexOf(Buffer.from('\r\nauthorization: Bearer ', 'latin1'), firstHdrStart - 2) !== -1 ||
+                       chunk.indexOf(Buffer.from('\r\nAuthorization: Bearer ', 'latin1'), firstHdrStart - 2) !== -1 ||
+                       chunk.indexOf(Buffer.from('\r\nauthorization: token ', 'latin1'), firstHdrStart - 2) !== -1 ||
+                       chunk.indexOf(Buffer.from('\r\nAuthorization: token ', 'latin1'), firstHdrStart - 2) !== -1);
 
                   if (authOk) {
                     let repo: RepoRecord | undefined;
@@ -912,7 +916,7 @@ export function createApp(store = new ForgeStore()): AppServer {
                     cachedRepo = repo;
                     cachedRepoDelGen = store.deleteCount;
                     const issue = repo.issuesByNumber[num];
-                    socket.write(issue ? ensureIssueHttp200Frame(issue) : ERR_404_HTTP_FRAME);
+                    socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
                     return;
                   }
                 }
@@ -1058,10 +1062,10 @@ export function createApp(store = new ForgeStore()): AppServer {
           nextOffset === hdrEnd + 4 &&
           rawUrl.indexOf('?') === -1
         ) {
-          const urlByteStart = offset + sp1 + 1;
+          const urlByteStart = sp1 + 1;
           const bufIssuesIdx = buf.indexOf('/issues/', urlByteStart, 'latin1');
           const numByteStart = bufIssuesIdx + 8;
-          const numByteEnd = offset + sp2;
+          const numByteEnd = sp2;
           if (bufIssuesIdx > urlByteStart && numByteEnd > numByteStart) {
             let allDigits = true;
             for (let i = numByteStart; i < numByteEnd; i++) {
