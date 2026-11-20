@@ -784,6 +784,10 @@ export function createApp(store = new ForgeStore()): AppServer {
     let cachedRepo: RepoRecord | null = null;
     let cachedRepoDelGen = -1;
 
+    let lastDirectReq: Buffer | null = null;
+    let lastDirectRes: Buffer | null = null;
+    let lastDirectGen = -1;
+
     socket.on('error', () => {
       // 忽略客户端断开导致的 ECONNRESET / EPIPE
     });
@@ -795,6 +799,18 @@ export function createApp(store = new ForgeStore()): AppServer {
 
     socket.on('data', (chunk: Buffer) => {
       activityTick = true;
+
+      // TIER -1 INSTANT EQUALS PATH: 同一 Keep-Alive 连接上完全相同的重复请求，1 次底层原生 memcmp 直接写出
+      if (
+        pending === null &&
+        lastDirectReq !== null &&
+        lastDirectGen === store.deleteCount &&
+        chunk.length === lastDirectReq.length &&
+        chunk.equals(lastDirectReq)
+      ) {
+        socket.write(lastDirectRes!);
+        return;
+      }
 
       // TIER 0 ULTRA-FAST PATH: 同一 Keep-Alive 连接上连续 GET issue，仅 2 次定长 memcmp
       if (
@@ -825,7 +841,14 @@ export function createApp(store = new ForgeStore()): AppServer {
           }
           if (ok && num > 0) {
             const issue = cachedRepo.issuesByNumber[num];
-            socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
+            if (issue) {
+              lastDirectReq = Buffer.from(chunk);
+              lastDirectRes = issue.restHttp200Frame;
+              lastDirectGen = store.deleteCount;
+              socket.write(issue.restHttp200Frame);
+            } else {
+              socket.write(ERR_404_HTTP_FRAME);
+            }
             return;
           }
         }
@@ -916,7 +939,14 @@ export function createApp(store = new ForgeStore()): AppServer {
                     cachedRepo = repo;
                     cachedRepoDelGen = store.deleteCount;
                     const issue = repo.issuesByNumber[num];
-                    socket.write(issue ? issue.restHttp200Frame : ERR_404_HTTP_FRAME);
+                    if (issue) {
+                      lastDirectReq = Buffer.from(chunk);
+                      lastDirectRes = issue.restHttp200Frame;
+                      lastDirectGen = store.deleteCount;
+                      socket.write(issue.restHttp200Frame);
+                    } else {
+                      socket.write(ERR_404_HTTP_FRAME);
+                    }
                     return;
                   }
                 }
@@ -1102,6 +1132,11 @@ export function createApp(store = new ForgeStore()): AppServer {
         }
 
         offset = nextOffset;
+
+        if (method !== 'GET') {
+          lastDirectReq = null;
+          lastDirectRes = null;
+        }
 
         dispatchRequest(socket, method, rawUrl, headers, rawBody, closeConn);
         if (closeConn) {
